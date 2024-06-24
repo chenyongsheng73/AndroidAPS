@@ -38,8 +38,8 @@ class MM640gPlugin @Inject constructor(
         .description(R.string.description_source_mm640g),
     aapsLogger, rh, injector
 ), BgSource {
-
-    // cannot be inner class because of needed injection
+// cannot be inner class because of needed injection
+   override fun advancedFilteringSupported(): Boolean = true
     class MM640gWorker(
         context: Context,
         params: WorkerParameters

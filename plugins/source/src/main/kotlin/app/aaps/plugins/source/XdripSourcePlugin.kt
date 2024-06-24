@@ -65,9 +65,9 @@ class XdripSourcePlugin @Inject constructor(
             GlucoseValue.SourceSensor.DEXCOM_G7_NATIVE_XDRIP
         ).any { it == glucoseValue.sourceSensor }
     }
-    // cannot be inner class because of needed injection
-    override fun advancedFilteringSupported(): Boolean = true
-    class XdripSourceWorker(
+     // cannot be inner class because of needed injection
+     override fun advancedFilteringSupported(): Boolean = true
+     class XdripSourceWorker(
         context: Context,
         params: WorkerParameters
     ) : LoggingWorker(context, params, Dispatchers.IO) {

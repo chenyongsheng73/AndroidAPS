@@ -33,8 +33,8 @@ class PathedOTAppPlugin @Inject constructor(injector: HasAndroidInjector, rh: Re
         .pluginName(R.string.patched_ottai_app)
         .description(R.string.description_source_patched_ottai_app),
     aapsLogger, rh, injector), BgSource {
-
     // cannot be inner class because of needed injection
+    override fun advancedFilteringSupported(): Boolean = true
     class PathedOTAppWorker(context: Context, params: WorkerParameters) : LoggingWorker(context, params, Dispatchers.IO) {
 
         @Inject lateinit var mOTAppPlugin: PathedOTAppPlugin

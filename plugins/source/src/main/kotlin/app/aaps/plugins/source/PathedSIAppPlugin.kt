@@ -38,8 +38,8 @@ class PathedSIAppPlugin @Inject constructor(
         .description(R.string.description_source_patched_si_app),
     aapsLogger, rh, injector
 ), BgSource {
-
     // cannot be inner class because of needed injection
+    override fun advancedFilteringSupported(): Boolean = true
     class PathedSIAppWorker(
         context: Context,
         params: WorkerParameters

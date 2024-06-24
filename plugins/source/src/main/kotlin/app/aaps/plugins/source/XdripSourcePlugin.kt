@@ -66,7 +66,7 @@ class XdripSourcePlugin @Inject constructor(
         ).any { it == glucoseValue.sourceSensor }
     }
     // cannot be inner class because of needed injection
-    override fun advancedFilteringSupported(): Boolean = true
+override fun advancedFilteringSupported(): Boolean = true
     class XdripSourceWorker(
         context: Context,
         params: WorkerParameters

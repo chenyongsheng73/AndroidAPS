@@ -38,8 +38,8 @@ class PathedSinoAppPlugin @Inject constructor(
         .description(R.string.description_source_patched_sino_app),
     aapsLogger, rh, injector
 ), BgSource {
-
     // cannot be inner class because of needed injection
+    override fun advancedFilteringSupported(): Boolean = true
     class PathedSinoAppWorker(
         context: Context,
         params: WorkerParameters

@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- MedtrumPump -->
+    <!-- 移宇 -->
     <string name="移宇">移宇</string>
     <string name="移宇_pump_shortname">MT</string>
     <string name="移宇_pump_description">移宇 Nano 和 移宇 300U 的泵体整合</string>

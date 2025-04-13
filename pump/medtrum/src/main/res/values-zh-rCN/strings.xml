@@ -2,9 +2,9 @@
 <resources>
     <!-- MedtrumPump -->
     <string name="medtrum">移宇</string>
-    <string name="medtrum_pump_description">移宇</string>
-    <string name="medtrum_pump_setting">移宇 Nano 和 移宇 300U 的泵体整合</string>
-    <string name="medtrum_pump_setting">移宇 泵体设定</string>
+    <string name="medtrum_pump_shortname">MT</string>
+    <string name="medtrum_pump_description">移宇 Nano 和 移宇 300U 的泵体整合</string>
+    <string name="medtrum_pump_setting">Medtrum 泵体设定</string>
     <string name="pump_error">泵体错误: %1$s !! </string>
     <string name="pump_warning">泵体警告: %1$s </string>
     <string name="pump_is_suspended">泵体已暂停</string>

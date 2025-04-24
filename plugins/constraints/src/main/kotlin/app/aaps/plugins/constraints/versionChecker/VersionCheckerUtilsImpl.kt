@@ -158,3 +158,4 @@ class VersionCheckerUtilsImpl @Inject constructor(
 fun String.numericVersionPart(): String =
     "(((\\d+)\\.)+(\\d+))(\\D(.*))?".toRegex().matchEntire(this)?.groupValues?.getOrNull(1)
         ?: ""
+

@@ -41,6 +41,7 @@ class MM640gPlugin @Inject constructor(
 ), BgSource {
 
     // cannot be inner class because of needed injection
+    override fun advancedFilteringSupported(): Boolean = true
     class MM640gWorker(
         context: Context,
         params: WorkerParameters

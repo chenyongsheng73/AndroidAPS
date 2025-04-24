@@ -36,6 +36,7 @@ class PathedOTAppPlugin @Inject constructor(rh: ResourceHelper, aapsLogger: AAPS
     aapsLogger, rh), BgSource {
 
     // cannot be inner class because of needed injection
+    override fun advancedFilteringSupported(): Boolean = true
     class PathedOTAppWorker(context: Context, params: WorkerParameters) : LoggingWorker(context, params, Dispatchers.IO) {
 
         @Inject lateinit var mOTAppPlugin: PathedOTAppPlugin

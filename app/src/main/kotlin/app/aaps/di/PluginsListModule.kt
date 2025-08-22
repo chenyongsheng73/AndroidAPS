@@ -305,7 +305,7 @@ abstract class PluginsListModule {
     @APS
     @IntoMap
     @IntKey(310)
-    abstract fun bindObjectivesPlugin(plugin: ObjectivesPlugin): PluginBase
+    //abstract fun bindObjectivesPlugin(plugin: ObjectivesPlugin): PluginBase
 
     @Binds
     @AllConfigs

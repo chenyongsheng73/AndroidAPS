@@ -439,7 +439,7 @@ class SWDefinition @Inject constructor(
             .add(screenPump)
             .add(screenAps)
             .add(screenSensitivity)
-            .add(getScreenObjectives)
+            //.add(getScreenObjectives)
 
     private fun swDefinitionPumpControl() = // List all the screens here
         add(screenSetupWizard)

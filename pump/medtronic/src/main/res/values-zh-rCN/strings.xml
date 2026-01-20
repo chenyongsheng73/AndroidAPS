@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- Medtronic (MDT) - Base -->
-    <string name="description_pump_medtronic">Medtronic 泵的集成，需要 RileyLink 设备和特定泵模型</string>
+    <!-- 美敦力 (MDT) - Base -->
+    <string name="description_pump_medtronic">美敦力泵的集成，需要 RileyLink 设备和特定泵模型</string>
     <!-- MDT Configuration -->
     <string name="medtronic_serial_number">泵序列号</string>
     <string name="medtronic_pump_type">泵类型</string>

@@ -1,4 +1,3 @@
-
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <!--    General-->
@@ -235,7 +234,7 @@
     <string name="cgm_sensor_insert">CGM Sensor Insert</string>
     <string name="careportal_pump_site_management">Pump Sites</string>
     <string name="careportal_cgm_site_management">CGM Sites</string>
-    <string name="careportal_cgmsensorstart">CGM Sensor Start</string>
+    <string name="careportal_cgmsensorstart">更换传感器</string>
     <string name="careportal_cgm_sensor_stop">CGM Sensor Stop</string>
     <string name="careportal_dad_alert">D.A.D. Alert</string>
     <string name="careportal_insulin_cartridge_change">Insulin Cartridge Change</string>
@@ -249,7 +248,7 @@
     <string name="careportal_carbscorrection">Carbs correction</string>
     <string name="careportal_openapsoffline">OpenAPS Offline</string>
     <string name="pump_battery_change">Pump Battery Change</string>
-    <string name="temporary_target">Temporary target</string>
+    <string name="temporary_target">临时目标</string>
     <string name="running_mode">Running mode</string>
     <string name="careportal_temporarytargetvalue">Temporary target value</string>
     <string name="careportal_temporarytargetcancel">Temporary target cancel</string>
@@ -481,7 +480,7 @@
     <string name="sensitivity">Sensitivity</string>
     <string name="isf_for_carbs">ISF for Calculator and Carbs Absorption: %1$.1f</string>
     <string name="autosens_long">Autosens Value: %.0f%%</string>
-    <string name="autosens_short">AS: %.0f%%</string>
+    <string name="autosens_short">敏感度: %.0f%%</string>
     <string name="algorithm_long">Autosens in algorithm: %.0f%%</string>
     <string name="algorithm_short">Alg: %.0f%%</string>
     <string name="a11y_file">file</string>
@@ -644,7 +643,7 @@
     <string name="cta_dont_kill_my_app_info">桥哥推荐</string>
     <string name="fabric_upload_disabled">Crash logs upload disabled!</string>
     <string name="about_link_urls">\n\n技术支持:我在桥上看风景\n\n闭环服务:桥哥团队</string>
-    
+
     <plurals name="days">
         <item quantity="one">%1$d day</item>
         <item quantity="other">%1$d days</item>

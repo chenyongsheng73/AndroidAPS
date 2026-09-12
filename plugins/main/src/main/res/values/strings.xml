@@ -305,7 +305,7 @@
     <string name="variable_sensitivity_shortname">VSENS</string>
     <string name="graph_scale">Graph scale</string>
     <string name="graph_menu_divider_header">Graph</string>
-    <string name="temp_basal_overview_short_name">T:</string>
+    <string name="temp_basal_overview_short_name">临基:</string>
 
     <!-- Skins -->
     <string name="classic_description">Original skin</string>

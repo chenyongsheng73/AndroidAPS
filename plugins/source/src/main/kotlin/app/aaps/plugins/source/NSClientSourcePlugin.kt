@@ -38,7 +38,7 @@ class NSClientSourcePlugin @Inject constructor(
     @VisibleForTesting
     var isAdvancedFilteringEnabled = false
 
-    override fun advancedFilteringSupported(): Boolean = isAdvancedFilteringEnabled
+    override fun advancedFilteringSupported(): Boolean = true
 
     override fun detectSource(glucoseValue: GV) {
         if (glucoseValue.timestamp > lastBGTimeStamp) {

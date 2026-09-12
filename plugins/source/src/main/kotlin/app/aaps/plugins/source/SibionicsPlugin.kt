@@ -24,6 +24,7 @@ import javax.inject.Inject
 import javax.inject.Singleton
 
 @Singleton
+override fun advancedFilteringSupported(): Boolean = true
 class SibionicsPlugin @Inject constructor(
     rh: ResourceHelper,
     aapsLogger: AAPSLogger,

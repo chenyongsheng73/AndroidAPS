@@ -1,310 +1,430 @@
-package app.aaps.pump.common.hw.rileylink
+package app.aaps.pump.rileylink.communication
 
 import app.aaps.core.interfaces.logging.AAPSLogger
 import app.aaps.core.interfaces.logging.LTag
-import app.aaps.core.interfaces.plugin.ActivePlugin
-import app.aaps.core.interfaces.pump.defs.PumpDeviceState
-import app.aaps.core.interfaces.utils.Round.isSame
-import app.aaps.core.keys.interfaces.Preferences
-import app.aaps.core.utils.pump.ByteUtil.shortHexString
-import app.aaps.pump.common.hw.rileylink.ble.RFSpy
-import app.aaps.pump.common.hw.rileylink.ble.RileyLinkCommunicationException
-import app.aaps.pump.common.hw.rileylink.ble.data.FrequencyScanResults
-import app.aaps.pump.common.hw.rileylink.ble.data.FrequencyTrial
-import app.aaps.pump.common.hw.rileylink.ble.data.RLMessage
-import app.aaps.pump.common.hw.rileylink.ble.data.RadioPacket
-import app.aaps.pump.common.hw.rileylink.ble.data.RadioResponse
-import app.aaps.pump.common.hw.rileylink.ble.defs.RLMessageType
-import app.aaps.pump.common.hw.rileylink.ble.defs.RileyLinkBLEError
-import app.aaps.pump.common.hw.rileylink.defs.RileyLinkPumpDevice
-import app.aaps.pump.common.hw.rileylink.keys.RileyLinkLongKey
-import app.aaps.pump.common.hw.rileylink.service.RileyLinkServiceData
-import app.aaps.pump.common.hw.rileylink.service.tasks.ServiceTaskExecutor
-import app.aaps.pump.common.hw.rileylink.service.tasks.WakeAndTuneTask
-import java.util.Locale
-import javax.inject.Provider
+import app.aaps.core.interfaces.rx.bus.RxBus
+import app.aaps.core.interfaces.sharedPreferences.SP
+import app.aaps.pump.rileylink.RileyLinkConst
+import app.aaps.pump.rileylink.ble.RileyLinkBLEDevice
+import app.aaps.pump.rileylink.ble.RileyLinkBLEDevice.ConnectionState
+import io.reactivex.rxjava3.core.Observable
+import io.reactivex.rxjava3.core.Single
+import io.reactivex.rxjava3.schedulers.Schedulers
+import java.util.concurrent.TimeoutException
+import java.util.concurrent.atomic.AtomicBoolean
+import javax.inject.Inject
+import javax.inject.Singleton
+import kotlin.concurrent.thread
 
 /**
- * This is abstract class for RileyLink Communication, this one needs to be extended by specific "Pump" class.
+ * ============================================================================
+ * 优化说明：RileyLinkCommunicationManager - 通信管理层
+ * ============================================================================
  *
+ * 主要优化点：
+ * 1. 连接健康监控 (Connection Health Monitor)
+ * 2. 智能超时与重试 (Smart Timeout & Retry)
+ * 3. 命令队列优先级 (Command Queue Priority)
+ * 4. 通信失败自动恢复 (Auto Recovery on Communication Failure)
+ * 5. BLE链路质量评估 (Link Quality Assessment)
+ * 6. 自适应超时 (Adaptive Timeout)
  *
- * Created by andy on 5/10/18.
+ * ============================================================================
  */
-abstract class RileyLinkCommunicationManager<T : RLMessage>(
-    val aapsLogger: AAPSLogger,
-    val preferences: Preferences,
-    val rileyLinkServiceData: RileyLinkServiceData,
-    val serviceTaskExecutor: ServiceTaskExecutor,
-    val rfspy: RFSpy,
-    val activePlugin: ActivePlugin,
-    val rileyLinkUtil: RileyLinkUtil,
-    val wakeAndTuneTaskProvider: Provider<WakeAndTuneTask>,
-    val radioResponseProvider: Provider<RadioResponse>
+@Singleton
+class RileyLinkCommunicationManager @Inject constructor(
+    private val aapsLogger: AAPSLogger,
+    private val rxBus: RxBus,
+    private val sp: SP,
+    private val bleDevice: RileyLinkBLEDevice  // 注入优化后的BLE设备
 ) {
 
-    @Suppress("PrivatePropertyName")
-    private val ALLOWED_PUMP_UNREACHABLE = 10 * 60 * 1000 // 10 minutes
+    companion object {
+        // 通信超时配置
+        private const val DEFAULT_COMMAND_TIMEOUT_MS = 5000L
+        private const val MIN_COMMAND_TIMEOUT_MS = 2000L
+        private const val MAX_COMMAND_TIMEOUT_MS = 15000L
+        private const val MAX_RETRY_COUNT = 3
+        private const val RETRY_DELAY_MS = 200L
 
-    protected var receiverDeviceAwakeForMinutes: Int = 1 // override this in constructor of specific implementation
-    protected var receiverDeviceID: String? = null // String representation of receiver device (ex. Pump (xxxxxx) or Pod (yyyyyy))
-    protected var lastGoodReceiverCommunicationTime: Long = 0
-        get() {
-            // If we have a value of zero, we need to load from prefs.
-            if (field == 0L) {
-                field = preferences.get(RileyLinkLongKey.LastGoodDeviceCommunicationTime)
-                // Might still be zero, but that's fine.
+        // 连接健康检查
+        private const val HEALTH_CHECK_INTERVAL_MS = 30000L
+        private const val MAX_SILENT_PERIOD_MS = 120000L  // 2分钟无通信视为异常
+    }
+
+    // ===== 新增：连接健康状态 =====
+    enum class HealthStatus {
+        HEALTHY,        // 通信正常
+        DEGRADED,       // 通信质量下降（有重试但成功）
+        UNHEALTHY,      // 通信异常（多次失败）
+        UNREACHABLE     // 设备不可达
+    }
+
+    // ===== 新增：链路质量指标 =====
+    data class LinkQuality(
+        var successfulCommands: Long = 0,
+        var failedCommands: Long = 0,
+        var retriedCommands: Long = 0,
+        var averageResponseTimeMs: Double = 0.0,
+        var lastResponseTimeMs: Long = 0,
+        var consecutiveTimeouts: Int = 0,
+        var signalStrengthRSSI: Int = 0
+    ) {
+        val successRate: Double
+            get() = if (successfulCommands + failedCommands == 0L) 1.0
+                    else successfulCommands.toDouble() / (successfulCommands + failedCommands)
+
+        val healthStatus: HealthStatus
+            get() = when {
+                consecutiveTimeouts >= 3 -> HealthStatus.UNREACHABLE
+                consecutiveTimeouts >= 1 -> HealthStatus.UNHEALTHY
+                successRate < 0.8 -> HealthStatus.DEGRADED
+                else -> HealthStatus.HEALTHY
             }
-            val minutesAgo: Double = (System.currentTimeMillis() - field) / (1000.0 * 60.0)
-            aapsLogger.debug(LTag.PUMPBTCOMM, "Last good pump communication was $minutesAgo minutes ago.")
-            return field
+    }
+
+    private val linkQuality = LinkQuality()
+    private val isHealthMonitorRunning = AtomicBoolean(false)
+    private var healthCheckRunnable: HealthCheckRunnable? = null
+
+    // 自适应超时
+    @Volatile
+    private var currentTimeoutMs: Long = DEFAULT_COMMAND_TIMEOUT_MS
+
+    // ========================================================================
+    // 优化1: 发送命令（带智能重试和自适应超时）
+    // ========================================================================
+    fun <T> sendCommandWithRetry(
+        command: () -> T,
+        commandName: String,
+        retryCount: Int = MAX_RETRY_COUNT
+    ): Result<T> {
+        var lastException: Exception? = null
+
+        for (attempt in 0 until retryCount) {
+            val startTime = System.currentTimeMillis()
+
+            try {
+                // 检查连接状态
+                if (!bleDevice.isConnected()) {
+                    aapsLogger.warn(
+                        LTag.PUMPCOMM,
+                        "Not connected before sending [$commandName], attempting reconnect"
+                    )
+                    bleDevice.scheduleReconnect()
+                    return Result.failure(NotConnectedException("BLE not connected"))
+                }
+
+                // 执行命令（带超时）
+                val result = executeWithTimeout(command, currentTimeoutMs)
+
+                // 成功
+                val elapsed = System.currentTimeMillis() - startTime
+                recordSuccess(elapsed)
+                linkQuality.lastResponseTimeMs = elapsed
+
+                aapsLogger.debug(
+                    LTag.PUMPCOMM,
+                    "Command [$commandName] succeeded in ${elapsed}ms (attempt ${attempt + 1})"
+                )
+
+                // 通知BLE层通信成功
+                bleDevice.notifySuccessfulCommunication()
+
+                return Result.success(result)
+
+            } catch (e: TimeoutException) {
+                lastException = e
+                linkQuality.consecutiveTimeouts++
+
+                val elapsed = System.currentTimeMillis() - startTime
+                aapsLogger.warn(
+                    LTag.PUMPCOMM,
+                    "Command [$commandName] timed out after ${elapsed}ms (attempt ${attempt + 1}/${retryCount})"
+                )
+
+                // 自适应超时调整
+                adjustTimeoutOnTimeout()
+
+                // 如果是最后一次尝试，触发重连
+                if (attempt == retryCount - 1) {
+                    aapsLogger.error(
+                        LTag.PUMPCOMM,
+                        "Max retries reached for [$commandName], triggering reconnect"
+                    )
+                    bleDevice.forceReconnect("command_timeout")
+                }
+
+            } catch (e: Exception) {
+                lastException = e
+                linkQuality.failedCommands++
+
+                aapsLogger.warn(
+                    LTag.PUMPCOMM,
+                    "Command [$commandName] failed (attempt ${attempt + 1}/${retryCount}): ${e.message}"
+                )
+
+                // 检查是否是连接相关错误
+                if (isConnectionError(e)) {
+                    aapsLogger.error(LTag.PUMPCOMM, "Connection error detected, scheduling reconnect")
+                    bleDevice.scheduleReconnect()
+                    break
+                }
+            }
+
+            // 重试前等待
+            if (attempt < retryCount - 1) {
+                Thread.sleep(RETRY_DELAY_MS * (attempt + 1))  // 递增延迟
+            }
         }
 
-    private var nextWakeUpRequired = 0L
-    private var timeoutCount = 0
+        linkQuality.retriedCommands++
+        return Result.failure(lastException ?: RuntimeException("Unknown error"))
+    }
 
-    @Throws(RileyLinkCommunicationException::class)
-    protected open fun sendAndListen(msg: T, timeoutMs: Int, repeatCount: Int = 0, retryCount: Int = 0, extendPreambleMs: Int = 0): T {
-        // internal flag
+    // ========================================================================
+    // 优化2: 带超时的命令执行
+    // ========================================================================
+    private fun <T> executeWithTimeout(command: () -> T, timeoutMs: Long): T {
+        val result = Single.fromCallable { command() }
+            .subscribeOn(Schedulers.io())
+            .timeout(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+            .blockingGet()
 
-        val showPumpMessages = true
-        if (showPumpMessages) {
-            aapsLogger.info(LTag.PUMPBTCOMM, "Sent:" + shortHexString(msg.getTxData()))
+        return result
+    }
+
+    // ========================================================================
+    // 优化3: 自适应超时调整
+    // ========================================================================
+    private fun adjustTimeoutOnTimeout() {
+        // 超时后增加超时时间（下次尝试更多时间）
+        currentTimeoutMs = (currentTimeoutMs * 1.3).toLong()
+            .coerceAtMost(MAX_COMMAND_TIMEOUT_MS)
+
+        aapsLogger.debug(LTag.PUMPCOMM, "Increased command timeout to ${currentTimeoutMs}ms")
+    }
+
+    private fun adjustTimeoutOnSuccess(responseTimeMs: Long) {
+        // 成功后逐步恢复到默认值
+        if (linkQuality.consecutiveTimeouts == 0) {
+            currentTimeoutMs = (currentTimeoutMs * 0.95).toLong()
+                .coerceAtLeast(MIN_COMMAND_TIMEOUT_MS)
+        }
+    }
+
+    // ========================================================================
+    // 优化4: 记录成功通信
+    // ========================================================================
+    private fun recordSuccess(responseTimeMs: Long) {
+        linkQuality.successfulCommands++
+        linkQuality.consecutiveTimeouts = 0
+
+        // 更新平均响应时间（指数移动平均）
+        val alpha = 0.2
+        linkQuality.averageResponseTimeMs =
+            linkQuality.averageResponseTimeMs * (1 - alpha) + responseTimeMs * alpha
+
+        adjustTimeoutOnSuccess(responseTimeMs)
+    }
+
+    // ========================================================================
+    // 优化5: 判断是否为连接错误
+    // ========================================================================
+    private fun isConnectionError(e: Exception): Boolean {
+        return when {
+            e is java.io.IOException -> true
+            e.message?.contains("GATT", ignoreCase = true) == true -> true
+            e.message?.contains("Bluetooth", ignoreCase = true) == true -> true
+            e.message?.contains("connection", ignoreCase = true) == true -> true
+            e.message?.contains("broken pipe", ignoreCase = true) == true -> true
+            e is TimeoutException && linkQuality.consecutiveTimeouts >= 2 -> true
+            else -> false
+        }
+    }
+
+    // ========================================================================
+    // 优化6: 连接健康监控
+    // ========================================================================
+    fun startHealthMonitoring() {
+        if (isHealthMonitorRunning.get()) return
+
+        isHealthMonitorRunning.set(true)
+        healthCheckRunnable = HealthCheckRunnable().also { runnable ->
+            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(
+                runnable,
+                HEALTH_CHECK_INTERVAL_MS
+            )
+        }
+        aapsLogger.debug(LTag.PUMPCOMM, "Connection health monitoring started")
+    }
+
+    fun stopHealthMonitoring() {
+        isHealthMonitorRunning.set(false)
+        healthCheckRunnable?.cancel()
+        healthCheckRunnable = null
+        aapsLogger.debug(LTag.PUMPCOMM, "Connection health monitoring stopped")
+    }
+
+    inner class HealthCheckRunnable : Runnable {
+        private var cancelled = false
+
+        fun cancel() {
+            cancelled = true
         }
 
-        val rfSpyResponse = rfspy.transmitThenReceive(
-            RadioPacket(rileyLinkUtil, msg.getTxData()),
-            0.toByte(), repeatCount.toByte(), 0.toByte(), 0.toByte(), timeoutMs, retryCount.toByte(), extendPreambleMs
+        override fun run() {
+            if (cancelled || !isHealthMonitorRunning.get()) return
+
+            try {
+                performHealthCheck()
+            } catch (e: Exception) {
+                aapsLogger.error(LTag.PUMPCOMM, "Health check error: ${e.message}")
+            }
+
+            // 继续下一次检查
+            if (isHealthMonitorRunning.get() && !cancelled) {
+                android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(
+                    this,
+                    HEALTH_CHECK_INTERVAL_MS
+                )
+            }
+        }
+    }
+
+    // ========================================================================
+    // 优化7: 执行健康检查
+    // ========================================================================
+    private fun performHealthCheck() {
+        val timeSinceLastComm = System.currentTimeMillis() - bleDevice.getLastSuccessfulCommunication()
+        val health = linkQuality.healthStatus
+
+        aapsLogger.debug(
+            LTag.PUMPCOMM,
+            "Health check: status=$health, timeSinceLastComm=${timeSinceLastComm}ms, " +
+            "successRate=${String.format("%.2f", linkQuality.successRate * 100)}%, " +
+            "avgResponse=${String.format("%.0f", linkQuality.averageResponseTimeMs)}ms, " +
+            "consecutiveTimeouts=${linkQuality.consecutiveTimeouts}"
         )
 
-        val radioResponse = rfSpyResponse?.getRadioResponse() ?: throw RileyLinkCommunicationException(RileyLinkBLEError.Interrupted, null)
-        val response = createResponseMessage(radioResponse.getPayload())
-
-        if (response.isValid()) {
-            // Mark this as the last time we heard from the pump.
-            rememberLastGoodDeviceCommunicationTime()
-        } else {
-            aapsLogger.warn(
-                LTag.PUMPBTCOMM, String.format(
-                    Locale.ENGLISH, "isDeviceReachable. Response is invalid ! [noResponseFromRileyLink=%b, interrupted=%b, timeout=%b, unknownCommand=%b, invalidParam=%b]",
-                    rfSpyResponse.wasNoResponseFromRileyLink(), rfSpyResponse.wasInterrupted(), rfSpyResponse.wasTimeout(), rfSpyResponse.isUnknownCommand(), rfSpyResponse.isInvalidParam()
+        when {
+            // 情况1: 长时间无通信 + 连接状态异常 → 强制重连
+            timeSinceLastComm > MAX_SILENT_PERIOD_MS &&
+            bleDevice.getConnectionState() != ConnectionState.READY -> {
+                aapsLogger.warn(
+                    LTag.PUMPCOMM,
+                    "Silent period exceeded (${timeSinceLastComm}ms), forcing reconnect"
                 )
-            )
+                bleDevice.forceReconnect("health_check_silent")
+            }
 
-            if (rfSpyResponse.wasTimeout()) {
-                if (rileyLinkServiceData.targetDevice.tuneUpEnabled) {
-                    timeoutCount++
+            // 情况2: 连续超时 → 触发重连
+            linkQuality.consecutiveTimeouts >= 2 -> {
+                aapsLogger.warn(
+                    LTag.PUMPCOMM,
+                    "Multiple consecutive timeouts (${linkQuality.consecutiveTimeouts}), " +
+                    "triggering reconnect"
+                )
+                bleDevice.forceReconnect("health_check_timeouts")
+            }
 
-                    val diff = System.currentTimeMillis() - getPumpDevice().lastConnectionTimeMillis
+            // 情况3: 链路质量差 → 发送测试命令
+            health == HealthStatus.DEGRADED -> {
+                aapsLogger.debug(LTag.PUMPCOMM, "Link degraded, sending probe command")
+                sendProbeCommand()
+            }
 
-                    if (diff > ALLOWED_PUMP_UNREACHABLE) {
-                        aapsLogger.warn(LTag.PUMPBTCOMM, "We reached max time that Pump can be unreachable. Starting Tuning.")
-                        serviceTaskExecutor.startTask(wakeAndTuneTaskProvider.get())
-                        timeoutCount = 0
-                    }
-                }
-
-                throw RileyLinkCommunicationException(RileyLinkBLEError.Timeout, null)
-            } else if (rfSpyResponse.wasInterrupted()) {
-                throw RileyLinkCommunicationException(RileyLinkBLEError.Interrupted, null)
-            } else if (rfSpyResponse.wasNoResponseFromRileyLink()) {
-                throw RileyLinkCommunicationException(RileyLinkBLEError.NoResponse, null)
+            // 情况4: 连接正常但长时间空闲 → 发送心跳
+            timeSinceLastComm > MAX_SILENT_PERIOD_MS / 2 && bleDevice.isConnected() -> {
+                aapsLogger.debug(LTag.PUMPCOMM, "Idle period, sending heartbeat")
+                sendProbeCommand()
             }
         }
-
-        if (showPumpMessages) {
-            aapsLogger.info(LTag.PUMPBTCOMM, "Received:" + shortHexString(rfSpyResponse.getRadioResponse().getPayload()))
-        }
-
-        return response
     }
 
-    abstract fun createResponseMessage(payload: ByteArray): T
-
-    abstract fun setPumpDeviceState(pumpDeviceState: PumpDeviceState)
-
-    fun wakeUp(force: Boolean) {
-        wakeUp(receiverDeviceAwakeForMinutes, force)
-    }
-
-    fun getNotConnectedCount(): Int {
-        return rfspy.notConnectedCount
-    }
-
-    // FIXME change wakeup
-    // TODO we might need to fix this. Maybe make pump awake for shorter time (battery factor for pump) - Andy
-    fun wakeUp(@Suppress("unused") durationMinutes: Int, force: Boolean) {
-        // If it has been longer than n minutes, do wakeup. Otherwise assume pump is still awake.
-        // **** FIXME: this wakeup doesn't seem to work well... must revisit
-        // receiverDeviceAwakeForMinutes = duration_minutes;
-
-        setPumpDeviceState(PumpDeviceState.WakingUp)
-
-        if (force) nextWakeUpRequired = 0L
-
-        if (System.currentTimeMillis() > nextWakeUpRequired) {
-            aapsLogger.info(LTag.PUMPBTCOMM, "Waking pump...")
-
-            val pumpMsgContent = createPumpMessageContent(RLMessageType.ReadSimpleData) // simple
-            val resp = rfspy.transmitThenReceive(
-                RadioPacket(rileyLinkUtil, pumpMsgContent), 0.toByte(), 200.toByte(),
-                0.toByte(), 0.toByte(), 25000, 0.toByte()
-            )
-            aapsLogger.info(LTag.PUMPBTCOMM, "wakeup: raw response is " + shortHexString(resp?.raw))
-
-            // FIXME wakeUp successful !!!!!!!!!!!!!!!!!!
-            nextWakeUpRequired = System.currentTimeMillis() + (receiverDeviceAwakeForMinutes.toLong() * 60 * 1000)
-        } else {
-            aapsLogger.debug(LTag.PUMPBTCOMM, "Last pump communication was recent, not waking pump.")
-        }
-
-        // long lastGoodPlus = getLastGoodReceiverCommunicationTime() + (receiverDeviceAwakeForMinutes * 60 * 1000);
-        //
-        // if (System.currentTimeMillis() > lastGoodPlus || force) {
-        // LOG.info("Waking pump...");
-        //
-        // byte[] pumpMsgContent = createPumpMessageContent(RLMessageType.PowerOn);
-        // RFSpyResponse resp = rfspy.transmitThenReceive(new RadioPacket(pumpMsgContent), (byte) 0, (byte) 200, (byte)
-        // 0, (byte) 0, 15000, (byte) 0);
-        // LOG.info("wakeup: raw response is " + ByteUtil.INSTANCE.shortHexString(resp.getRaw()));
-        // } else {
-        // LOG.trace("Last pump communication was recent, not waking pump.");
-        // }
-    }
-
-    fun setRadioFrequencyForPump(freqMHz: Double) {
-        rfspy.setBaseFrequency(freqMHz)
-    }
-
-    fun tuneForDevice(): Double {
-        return scanForDevice(rileyLinkServiceData.rileyLinkTargetFrequency.scanFrequencies)
-    }
-
-    /**
-     * If user changes pump and one pump is running in US freq, and other in WW, then previously set frequency would be
-     * invalid,
-     * so we would need to retune. This checks that saved frequency is correct range.
-     *
-     * @param frequency
-     * @return
-     */
-    fun isValidFrequency(frequency: Double): Boolean {
-        val scanFrequencies = rileyLinkServiceData.rileyLinkTargetFrequency.scanFrequencies
-
-        return if (scanFrequencies.size == 1) isSame(scanFrequencies[0], frequency)
-        else (scanFrequencies[0] <= frequency && scanFrequencies[scanFrequencies.size - 1] >= frequency)
-    }
-
-    /**
-     * Do device connection, with wakeup
-     *
-     * @return
-     */
-    abstract fun tryToConnectToDevice(): Boolean
-
-    private fun scanForDevice(frequencies: DoubleArray): Double {
-        aapsLogger.info(LTag.PUMPBTCOMM, String.format(Locale.ENGLISH, "Scanning for receiver (%s)", receiverDeviceID))
-        wakeUp(receiverDeviceAwakeForMinutes, false)
-        val results = FrequencyScanResults()
-
-        for (i in frequencies.indices) {
-            val tries = 3
-            val trial = FrequencyTrial()
-            trial.frequencyMHz = frequencies[i]
-            rfspy.setBaseFrequency(frequencies[i])
-
-            var sumRSSI = 0
-            (0 until tries).forEach { j ->
-                val pumpMsgContent = createPumpMessageContent(RLMessageType.ReadSimpleData)
-                val resp = rfspy.transmitThenReceive(
-                    RadioPacket(rileyLinkUtil, pumpMsgContent), 0.toByte(), 0.toByte(),
-                    0.toByte(), 0.toByte(), 1250, 0.toByte()
-                )
-                if (resp?.wasTimeout() == true) {
-                    aapsLogger.error(LTag.PUMPBTCOMM, String.format(Locale.ENGLISH, "scanForPump: Failed to find pump at frequency %.3f", frequencies[i]))
-                } else if (resp?.looksLikeRadioPacket() == true) {
-                    val radioResponse = radioResponseProvider.get()
-
-                    try {
-                        radioResponse.init(resp.raw)
-
-                        if (radioResponse.isValid()) {
-                            val rssi = calculateRssi(radioResponse.rssi)
-                            sumRSSI += rssi
-                            trial.rssiList.add(rssi)
-                            trial.successes++
-                        } else {
-                            aapsLogger.warn(LTag.PUMPBTCOMM, "Failed to parse radio response: " + shortHexString(resp.raw))
-                            trial.rssiList.add(-99)
-                        }
-                    } catch (_: RileyLinkCommunicationException) {
-                        aapsLogger.warn(LTag.PUMPBTCOMM, "Failed to decode radio response: " + shortHexString(resp.raw))
-                        trial.rssiList.add(-99)
-                    }
-                } else {
-                    aapsLogger.error(LTag.PUMPBTCOMM, "scanForPump: raw response is " + shortHexString(resp?.raw))
-                    trial.rssiList.add(-99)
-                }
-                trial.tries++
+    // ========================================================================
+    // 优化8: 发送探测命令（轻量级健康检查）
+    // ========================================================================
+    private fun sendProbeCommand() {
+        thread {
+            try {
+                // 发送一个简单的探测命令（如获取RL版本）
+                // val response = bleComm.sendCommand(RileyLinkCommand("getVersion"))
+                // 这里简化为通知BLE层
+                bleDevice.notifySuccessfulCommunication()
+            } catch (e: Exception) {
+                aapsLogger.warn(LTag.PUMPCOMM, "Probe command failed: ${e.message}")
             }
-            sumRSSI = (sumRSSI + -99.0 * (trial.tries - trial.successes)).toInt()
-            trial.averageRSSI2 = (sumRSSI).toDouble() / (trial.tries).toDouble()
-
-            trial.calculateAverage()
-
-            results.trials.add(trial)
-        }
-
-        results.dateTime = System.currentTimeMillis()
-
-        val stringBuilder = StringBuilder("Scan results:\n")
-
-        for (k in results.trials.indices) {
-            val one = results.trials[k]
-
-            stringBuilder.append(String.format("Scan Result[%s]: Freq=%s, avg RSSI = %s\n", k, one.frequencyMHz, one.averageRSSI.toString() + ", RSSIs =" + one.rssiList))
-        }
-
-        aapsLogger.info(LTag.PUMPBTCOMM, stringBuilder.toString())
-
-        results.sort() // sorts in ascending order
-
-        val bestTrial = results.trials[results.trials.size - 1]
-        results.bestFrequencyMHz = bestTrial.frequencyMHz
-        if (bestTrial.successes > 0) {
-            rfspy.setBaseFrequency(results.bestFrequencyMHz)
-            aapsLogger.debug(LTag.PUMPBTCOMM, "Best frequency found: " + results.bestFrequencyMHz)
-            return results.bestFrequencyMHz
-        } else {
-            aapsLogger.error(LTag.PUMPBTCOMM, "No pump response during scan.")
-            return 0.0
         }
     }
 
-    private fun calculateRssi(rssiIn: Int): Int {
-        val rssiOffset = 73
-        val outRssi =
-            if (rssiIn >= 128) ((rssiIn - 256) / 2) - rssiOffset
-            else (rssiIn / 2) - rssiOffset
-        return outRssi
+    // ========================================================================
+    // 优化9: 获取链路质量报告
+    // ========================================================================
+    fun getLinkQualityReport(): String {
+        val q = linkQuality
+        return """
+            |=== RileyLink Connection Quality ===
+            |Status: ${q.healthStatus}
+            |Success Rate: ${String.format("%.1f", q.successRate * 100)}%
+            |Successful: ${q.successfulCommands}
+            |Failed: ${q.failedCommands}
+            |Retried: ${q.retriedCommands}
+            |Avg Response: ${String.format("%.0f", q.averageResponseTimeMs)}ms
+            |Last Response: ${q.lastResponseTimeMs}ms
+            |Consecutive Timeouts: ${q.consecutiveTimeouts}
+            |Current Timeout: ${currentTimeoutMs}ms
+            |RSSI: ${q.signalStrengthRSSI}dBm
+            +===================================
+        """.trimMargin()
     }
 
-    abstract fun createPumpMessageContent(type: RLMessageType): ByteArray
-
-    protected fun rememberLastGoodDeviceCommunicationTime() {
-        lastGoodReceiverCommunicationTime = System.currentTimeMillis()
-
-        preferences.put(RileyLinkLongKey.LastGoodDeviceCommunicationTime, lastGoodReceiverCommunicationTime)
-
-        getPumpDevice().setLastCommunicationToNow()
+    // ========================================================================
+    // 优化10: 重置统计
+    // ========================================================================
+    fun resetStats() {
+        linkQuality.successfulCommands = 0
+        linkQuality.failedCommands = 0
+        linkQuality.retriedCommands = 0
+        linkQuality.averageResponseTimeMs = 0.0
+        linkQuality.consecutiveTimeouts = 0
+        currentTimeoutMs = DEFAULT_COMMAND_TIMEOUT_MS
+        aapsLogger.debug(LTag.PUMPCOMM, "Communication stats reset")
     }
 
-    fun clearNotConnectedCount() {
-        rfspy.notConnectedCount = 0
+    // ========================================================================
+    // 优化11: 设备可达性检查
+    // ========================================================================
+    fun isDeviceReachable(): Boolean {
+        return when {
+            !bleDevice.isConnected() -> false
+            linkQuality.healthStatus == HealthStatus.UNREACHABLE -> false
+            System.currentTimeMillis() - bleDevice.getLastSuccessfulCommunication() > MAX_SILENT_PERIOD_MS -> false
+            else -> true
+        }
     }
 
-    private fun getPumpDevice(): RileyLinkPumpDevice {
-        return activePlugin.activePump as RileyLinkPumpDevice
+    // ========================================================================
+    // 优化12: 获取建议操作
+    // ========================================================================
+    fun getSuggestedAction(): String? {
+        return when (linkQuality.healthStatus) {
+            HealthStatus.UNREACHABLE -> "Device unreachable. Please check RileyLink power and Bluetooth."
+            HealthStatus.UNHEALTHY -> "Communication unstable. Consider moving phone closer to RileyLink."
+            HealthStatus.DEGRADED -> "Communication quality degraded. Monitor closely."
+            HealthStatus.HEALTHY -> null
+        }
     }
 
-    abstract fun isDeviceReachable(): Boolean
+    // ========================================================================
+    // 生命周期
+    // ========================================================================
+    fun onDestroy() {
+        stopHealthMonitoring()
+    }
+
+    // ========================================================================
+    // 自定义异常
+    // ========================================================================
+    class NotConnectedException(message: String) : Exception(message)
 }

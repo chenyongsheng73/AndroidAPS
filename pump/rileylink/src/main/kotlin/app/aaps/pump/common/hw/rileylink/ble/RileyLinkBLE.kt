@@ -392,21 +392,73 @@ class RileyLinkBLE @Inject constructor(
                         else                                 -> "UNKNOWN newState ($newState)"
                     }
 
-                    aapsLogger.warn(LTag.PUMPBTCOMM, "onConnectionStateChange " + getGattStatusMessage(status) + " " + stateMessage)
-                }
-                if (newState == BluetoothProfile.STATE_CONNECTED) {
-                    if (status == BluetoothGatt.GATT_SUCCESS) rileyLinkUtil.sendBroadcastMessage(RileyLinkConst.Intents.BluetoothConnected)
-                    else aapsLogger.debug(LTag.PUMPBTCOMM, "BT State connected, GATT status $status (${getGattStatusMessage(status)})")
-                } else if (newState == BluetoothProfile.STATE_CONNECTING || newState == BluetoothProfile.STATE_DISCONNECTING) {
-                    aapsLogger.debug(LTag.PUMPBTCOMM, "We are in ${if (status == BluetoothProfile.STATE_CONNECTING) "Connecting" else "Disconnecting"} state.")
-                } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                    rileyLinkUtil.sendBroadcastMessage(RileyLinkConst.Intents.RileyLinkDisconnected)
-                    if (manualDisconnect) close()
-                    aapsLogger.warn(LTag.PUMPBTCOMM, "RileyLink Disconnected.")
-                } else {
-                    aapsLogger.warn(LTag.PUMPBTCOMM, String.format(Locale.ENGLISH, "Some other state: (status=%d, newState=%d)", status, newState))
-                }
+                    override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
+    super.onConnectionStateChange(gatt, status, newState)
+
+    val stateMessage = when (newState) {
+        BluetoothProfile.STATE_CONNECTED    -> "CONNECTED"
+        BluetoothProfile.STATE_CONNECTING   -> "CONNECTING"
+        BluetoothProfile.STATE_DISCONNECTED -> "DISCONNECTED"
+        BluetoothProfile.STATE_DISCONNECTING -> "DISCONNECTING"
+        else                                -> "UNKNOWN($newState)"
+    }
+
+    if (gattDebugEnabled) {
+        aapsLogger.warn(LTag.PUMPBTCOMM, "onConnectionStateChange " + getGattStatusMessage(status) + " " + stateMessage)
+    }
+
+    // ---- 133 bug: 延迟重连 ----
+    if (status == 133) {
+        aapsLogger.error(LTag.PUMPBTCOMM, "Got the status 133 bug, closing gatt and scheduling reconnect")
+        isConnected = false
+        disconnect()
+        SystemClock.sleep(500)
+        android.os.Handler(context.mainLooper).postDelayed({
+            aapsLogger.debug(LTag.PUMPBTCOMM, "Reconnecting after 133...")
+            connectGattInternal()
+        }, 2000L)
+        return
+    }
+
+    when (newState) {
+        BluetoothProfile.STATE_CONNECTED -> {
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                rileyLinkUtil.sendBroadcastMessage(RileyLinkConst.Intents.BluetoothConnected)
+            } else {
+                aapsLogger.debug(LTag.PUMPBTCOMM, "BT State connected, GATT status $status (${getGattStatusMessage(status)})")
             }
+        }
+
+        BluetoothProfile.STATE_CONNECTING, BluetoothProfile.STATE_DISCONNECTING -> {
+            aapsLogger.debug(LTag.PUMPBTCOMM, "We are in ${if (newState == BluetoothProfile.STATE_CONNECTING) "Connecting" else "Disconnecting"} state.")
+        }
+
+        BluetoothProfile.STATE_DISCONNECTED -> {
+            rileyLinkUtil.sendBroadcastMessage(RileyLinkConst.Intents.RileyLinkDisconnected)
+            isConnected = false
+
+            if (manualDisconnect) {
+                // 用户/代码主动断开 → 关闭连接，不重连
+                close()
+                aapsLogger.warn(LTag.PUMPBTCOMM, "RileyLink Disconnected (manual).")
+            } else {
+                // ★ 异常断联（信号丢失/链路断开）→ 延迟 1.5s 重连
+                aapsLogger.warn(LTag.PUMPBTCOMM, "RileyLink Disconnected (abnormal, status=$status), scheduling reconnect in 1.5s")
+                android.os.Handler(context.mainLooper).postDelayed({
+                    // 重连前再检查一次，避免手动断开后又触发
+                    if (!isConnected && !manualDisconnect) {
+                        aapsLogger.debug(LTag.PUMPBTCOMM, "Executing reconnect after abnormal disconnect...")
+                        connectGattInternal()
+                    }
+                }, 1500L)
+            }
+        }
+
+        else -> {
+            aapsLogger.warn(LTag.PUMPBTCOMM, String.format(Locale.ENGLISH, "Some other state: (status=%d, newState=%d)", status, newState))
+        }
+    }
+}
 
             @Suppress("DEPRECATION")
             override fun onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {

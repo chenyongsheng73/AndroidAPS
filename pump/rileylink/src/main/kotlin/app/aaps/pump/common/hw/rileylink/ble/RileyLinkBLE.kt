@@ -42,8 +42,14 @@ import javax.inject.Inject
 import javax.inject.Singleton
 
 /**
- * Created by geoff on 5/26/16.
- * Added: State handling, configuration of RF for different configuration ranges, connection handling
+ * RileyLink BLE 通信管理层
+ *
+ * 优化点:
+ * - 统一 GATT 操作模板方法，消除 read/write/notify 的重复代码
+ * - 使用 try/finally 保护信号量，防止泄漏
+ * - 收敛日志开关判断
+ * - 提取常量，消除魔法数字
+ * - 改善空安全和可读性
  */
 @Singleton
 class RileyLinkBLE @Inject constructor(
@@ -56,59 +62,41 @@ class RileyLinkBLE @Inject constructor(
     private val config: Config
 ) {
 
+    // region Constants
+    companion object {
+        private const val GATT_STATUS_STRANGE_BUG = 133
+        private const val YIELD_SLEEP_MS: Long = 1
+        private const val DISCONNECT_CLOSE_DELAY_MS = 500L
+    }
+    // endregion
+
+    // region Properties
     private val gattDebugEnabled = true
     private var manualDisconnect = false
 
-    //val bluetoothAdapter: BluetoothAdapter = BluetoothAdapter.getDefaultAdapter()
-    val bluetoothAdapter: BluetoothAdapter? get() = (context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager?)?.adapter
+    val bluetoothAdapter: BluetoothAdapter?
+        get() = (context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager?)?.adapter
+
     private val bluetoothGattCallback: BluetoothGattCallback
     var rileyLinkDevice: BluetoothDevice? = null
+        private set
+
     private var bluetoothConnectionGatt: BluetoothGatt? = null
     private var mCurrentOperation: BLECommOperation? = null
     private val gattOperationSema = Semaphore(1, true)
-    private var radioResponseCountNotified: Runnable? = null
-    var isConnected = false
-        private set
 
-    @Inject fun onInit() {
-        //aapsLogger.debug(LTag.PUMPBTCOMM, "BT Adapter: " + this.bluetoothAdapter);
+    private var radioResponseCountNotified: Runnable? = null
+
+    var isConnected: Boolean = false
+        private set
+    // endregion
+
+    init {
+        bluetoothGattCallback = createGattCallback()
         orangeLink.rileyLinkBLE = this
     }
 
-    private fun isAnyRileyLinkServiceFound(service: BluetoothGattService): Boolean {
-        val found = GattAttributes.isRileyLink(service.uuid)
-        if (found) return true
-        else
-            for (serviceI in service.includedServices) {
-                if (isAnyRileyLinkServiceFound(serviceI)) return true
-                orangeLink.checkIsOrange(serviceI.uuid)
-            }
-        return false
-    }
-
-    fun debugService(service: BluetoothGattService, indentCount: Int, stringBuilder: StringBuilder) {
-        val indentString = StringUtils.repeat(' ', indentCount)
-        if (gattDebugEnabled) {
-            val uuidServiceString = service.uuid.toString()
-
-            stringBuilder.append(indentString)
-            stringBuilder.append(GattAttributes.lookup(uuidServiceString, "Unknown service"))
-            stringBuilder.append(" ($uuidServiceString)")
-            for (character in service.characteristics) {
-                val uuidCharacteristicString = character.uuid.toString()
-                stringBuilder.append("\n    ")
-                stringBuilder.append(indentString)
-                stringBuilder.append(" - " + GattAttributes.lookup(uuidCharacteristicString, "Unknown Characteristic"))
-                stringBuilder.append(" ($uuidCharacteristicString)")
-            }
-            stringBuilder.append("\n\n")
-
-            //aapsLogger.warn(LTag.PUMPBTCOMM, stringBuilder.toString());
-            for (serviceI in service.includedServices) {
-                debugService(serviceI, indentCount + 4, stringBuilder)
-            }
-        }
-    }
+    // region Public API
 
     fun registerRadioResponseCountNotification(notifier: Runnable?) {
         radioResponseCountNotified = notifier
@@ -116,76 +104,78 @@ class RileyLinkBLE @Inject constructor(
 
     @SuppressLint("MissingPermission")
     fun discoverServices(): Boolean {
-        // shouldn't happen, but if it does we exit
-        bluetoothConnectionGatt ?: return false
-
-        return if (bluetoothConnectionGatt?.discoverServices() == true) {
-            aapsLogger.warn(LTag.PUMPBTCOMM, "Starting to discover GATT Services.")
+        val gatt = bluetoothConnectionGatt ?: return false
+        return if (gatt.discoverServices()) {
+            logWarn(LTag.PUMPBTCOMM, "Starting to discover GATT Services.")
             true
         } else {
-            aapsLogger.error(LTag.PUMPBTCOMM, "Cannot discover GATT Services.")
+            logError(LTag.PUMPBTCOMM, "Cannot discover GATT Services.")
             false
         }
     }
 
     fun enableNotifications(): Boolean {
-        val result = setNotificationBlocking(UUID.fromString(GattAttributes.SERVICE_RADIO), UUID.fromString(GattAttributes.CHARA_RADIO_RESPONSE_COUNT))
+        val result = setNotificationBlocking(
+            UUID.fromString(GattAttributes.SERVICE_RADIO),
+            UUID.fromString(GattAttributes.CHARA_RADIO_RESPONSE_COUNT)
+        )
         if (result.resultCode != BLECommOperationResult.RESULT_SUCCESS) {
-            aapsLogger.error(LTag.PUMPBTCOMM, "Error setting response count notification")
+            logError(LTag.PUMPBTCOMM, "Error setting response count notification")
             return false
         }
-        return if (rileyLinkServiceData.isOrange) orangeLink.enableNotifications()
-        else true
+        return if (rileyLinkServiceData.isOrange) orangeLink.enableNotifications() else true
     }
 
     fun findRileyLink(rileyLinkAddress: String) {
-        aapsLogger.debug(LTag.PUMPBTCOMM, "RileyLink address: $rileyLinkAddress")
-        // Must verify that this is a valid MAC, or crash.
-        //macAddress = RileyLinkAddress;
-        val useScanning = preferences.get(RileylinkBooleanPreferenceKey.OrangeUseScanning)
-        if (useScanning) {
-            aapsLogger.debug(LTag.PUMPBTCOMM, "Start scan for OrangeLink device.")
+        logDebug(LTag.PUMPBTCOMM, "RileyLink address: $rileyLinkAddress")
+        if (preferences.get(RileylinkBooleanPreferenceKey.OrangeUseScanning)) {
+            logDebug(LTag.PUMPBTCOMM, "Start scan for OrangeLink device.")
             orangeLink.startScan()
         } else {
             rileyLinkDevice = bluetoothAdapter?.getRemoteDevice(rileyLinkAddress)
-            // if this succeeds, we get a connection state change callback?
             if (rileyLinkDevice != null) connectGattInternal()
-            else aapsLogger.error(LTag.PUMPBTCOMM, "RileyLink device not found with address: $rileyLinkAddress")
+            else logError(LTag.PUMPBTCOMM, "RileyLink device not found with address: $rileyLinkAddress")
         }
     }
 
     fun connectGatt() {
-        val useScanning = preferences.get(RileylinkBooleanPreferenceKey.OrangeUseScanning)
-        if (useScanning) {
-            aapsLogger.debug(LTag.PUMPBTCOMM, "Start scan for OrangeLink device.")
+        if (preferences.get(RileylinkBooleanPreferenceKey.OrangeUseScanning)) {
+            logDebug(LTag.PUMPBTCOMM, "Start scan for OrangeLink device.")
             orangeLink.startScan()
         } else {
             connectGattInternal()
         }
     }
 
-    // This function must be run on UI thread.
-    @SuppressLint("HardwareIds")
+    @SuppressLint("HardwareIds", "MissingPermission")
     fun connectGattInternal() {
-        if (rileyLinkDevice == null) {
-            aapsLogger.error(LTag.PUMPBTCOMM, "RileyLink device is null, can't do connectGatt.")
+        val device = rileyLinkDevice ?: run {
+            logError(LTag.PUMPBTCOMM, "RileyLink device is null, can't do connectGatt.")
             return
         }
-        if (config.PUMPDRIVERS && ContextCompat.checkSelfPermission(context, "android.permission.BLUETOOTH_CONNECT") != PackageManager.PERMISSION_GRANTED) {
-            aapsLogger.debug(LTag.PUMPBTCOMM, "no permission")
+
+        if (config.PUMPDRIVERS &&
+            ContextCompat.checkSelfPermission(context, "android.permission.BLUETOOTH_CONNECT") != PackageManager.PERMISSION_GRANTED
+        ) {
+            logDebug(LTag.PUMPBTCOMM, "No BLUETOOTH_CONNECT permission")
             return
-        } else bluetoothConnectionGatt = rileyLinkDevice?.connectGatt(context, true, bluetoothGattCallback)
-        // , BluetoothDevice.TRANSPORT_LE
-        if (bluetoothConnectionGatt == null)
-            aapsLogger.error(LTag.PUMPBTCOMM, "Failed to connect to Bluetooth Low Energy device at " + bluetoothAdapter?.address)
-        else {
-            if (gattDebugEnabled) aapsLogger.debug(LTag.PUMPBTCOMM, "Gatt Connected.")
-            bluetoothConnectionGatt?.device?.name?.let { deviceName ->
-                // Update stored name upon connecting (also for backwards compatibility for device where a name was not yet stored)
-                if (StringUtils.isNotEmpty(deviceName)) preferences.put(RileyLinkStringKey.Name, deviceName)
-                else preferences.remove(RileyLinkStringKey.Name)
+        }
+
+        bluetoothConnectionGatt = device.connectGatt(context, true, bluetoothGattCallback)
+        val gatt = bluetoothConnectionGatt
+
+        if (gatt == null) {
+            logError(LTag.PUMPBTCOMM, "Failed to connect to BLE device at ${bluetoothAdapter?.address}")
+        } else {
+            logDebug(LTag.PUMPBTCOMM, "Gatt Connected.")
+            gatt.device.name?.let { deviceName ->
+                if (StringUtils.isNotEmpty(deviceName)) {
+                    preferences.put(RileyLinkStringKey.Name, deviceName)
+                } else {
+                    preferences.remove(RileyLinkStringKey.Name)
+                }
                 rileyLinkServiceData.rileyLinkName = deviceName
-                rileyLinkServiceData.rileyLinkAddress = bluetoothConnectionGatt?.device?.address
+                rileyLinkServiceData.rileyLinkAddress = gatt.device.address
             }
         }
     }
@@ -193,13 +183,9 @@ class RileyLinkBLE @Inject constructor(
     @SuppressLint("MissingPermission")
     fun disconnect() {
         isConnected = false
-        aapsLogger.warn(LTag.PUMPBTCOMM, "Closing GATT connection")
-        // Close old connection
-        if (bluetoothConnectionGatt != null) {
-            // Not sure if to disconnect or to close first..
-            bluetoothConnectionGatt?.disconnect()
-            manualDisconnect = true
-        }
+        logWarn(LTag.PUMPBTCOMM, "Closing GATT connection")
+        manualDisconnect = true
+        bluetoothConnectionGatt?.disconnect()
     }
 
     @SuppressLint("MissingPermission")
@@ -208,262 +194,258 @@ class RileyLinkBLE @Inject constructor(
         bluetoothConnectionGatt = null
     }
 
-    @SuppressLint("MissingPermission")
-    fun setNotificationBlocking(serviceUUID: UUID?, charaUUID: UUID?): BLECommOperationResult {
-        val retValue = BLECommOperationResult()
-        if (bluetoothConnectionGatt == null) {
-            aapsLogger.error(LTag.PUMPBTCOMM, "setNotification_blocking: not configured!")
-            retValue.resultCode = BLECommOperationResult.RESULT_NOT_CONFIGURED
-            return retValue
-        }
-        gattOperationSema.acquire()
-        SystemClock.sleep(1) // attempting to yield thread, to make sequence of events easier to follow
-        if (mCurrentOperation != null) retValue.resultCode = BLECommOperationResult.RESULT_BUSY
-        else {
-            if (bluetoothConnectionGatt?.getService(serviceUUID) == null) {
-                // Catch if the service is not supported by the BLE device
-                retValue.resultCode = BLECommOperationResult.RESULT_NONE
-                aapsLogger.error(LTag.PUMPBTCOMM, "BT Device not supported")
-                // TODO: 11/07/2016 UI update for user
-                // xyz rileyLinkServiceData.setServiceState(RileyLinkServiceState.BluetoothError, RileyLinkError.NoBluetoothAdapter);
-            } else {
-                bluetoothConnectionGatt?.let { bluetoothConnectionGatt ->
-                    val chara = bluetoothConnectionGatt.getService(serviceUUID)?.getCharacteristic(charaUUID) ?: return retValue.apply { resultCode = BLECommOperationResult.RESULT_NONE }
-                    // Tell Android that we want the notifications
-                    bluetoothConnectionGatt.setCharacteristicNotification(chara, true)
-                    val list = chara.descriptors
-                    if (list.isNotEmpty()) {
-                        if (gattDebugEnabled) for (i in list.indices) aapsLogger.debug(LTag.PUMPBTCOMM, "Found descriptor: " + list[i].toString())
-                        // Tell the remote device to send the notifications
-                        mCurrentOperation = DescriptorWriteOperation(aapsLogger, bluetoothConnectionGatt, list[0], BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
-                        mCurrentOperation?.execute(this)
-                        when {
-                            mCurrentOperation?.timedOut == true    -> retValue.resultCode = BLECommOperationResult.RESULT_TIMEOUT
-                            mCurrentOperation?.interrupted == true -> retValue.resultCode = BLECommOperationResult.RESULT_INTERRUPTED
-                            else                                   -> retValue.resultCode = BLECommOperationResult.RESULT_SUCCESS
-                        }
-                    } else return retValue.apply { resultCode = BLECommOperationResult.RESULT_NONE }
+    // endregion
+
+    // region GATT Operations (unified template)
+
+    fun setNotificationBlocking(serviceUUID: UUID?, charaUUID: UUID?): BLECommOperationResult =
+        executeGattOperation(
+            serviceUUID = serviceUUID,
+            charaUUID = charaUUID,
+            operationName = "setNotification",
+            preCheck = { gatt, service, characteristic ->
+                gatt.setCharacteristicNotification(characteristic, true)
+                val descriptors = characteristic.descriptors
+                if (descriptors.isEmpty()) {
+                    BLECommOperationResult().apply { resultCode = BLECommOperationResult.RESULT_NONE }
+                } else {
+                    DescriptorWriteOperation(aapsLogger, gatt, descriptors[0], BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
                 }
             }
-            mCurrentOperation = null
-            gattOperationSema.release()
-        }
-        return retValue
-    }
+        )
 
-    // call from main
     fun writeCharacteristicBlocking(serviceUUID: UUID, charaUUID: UUID, value: ByteArray): BLECommOperationResult {
-        val retValue = BLECommOperationResult()
+        val result = BLECommOperationResult().apply { this.value = value }
         if (bluetoothConnectionGatt == null) {
-            aapsLogger.error(LTag.PUMPBTCOMM, "writeCharacteristic_blocking: not configured!")
+            logError(LTag.PUMPBTCOMM, "writeCharacteristic_blocking: not configured!")
+            result.resultCode = BLECommOperationResult.RESULT_NOT_CONFIGURED
+            return result
+        }
+        return executeGattOperation(
+            serviceUUID = serviceUUID,
+            charaUUID = charaUUID,
+            operationName = "writeCharacteristic",
+            preCheck = { gatt, _, characteristic ->
+                CharacteristicWriteOperation(aapsLogger, gatt, characteristic, value)
+            },
+            resultTransformer = { op, res ->
+                // result already has value set
+                res
+            }
+        )
+    }
+
+    fun readCharacteristicBlocking(serviceUUID: UUID?, charaUUID: UUID?): BLECommOperationResult =
+        executeGattOperation(
+            serviceUUID = serviceUUID,
+            charaUUID = charaUUID,
+            operationName = "readCharacteristic",
+            preCheck = { gatt, _, characteristic ->
+                CharacteristicReadOperation(aapsLogger, gatt, characteristic)
+            },
+            resultTransformer = { op, res ->
+                if (res.resultCode == BLECommOperationResult.RESULT_SUCCESS) {
+                    res.value = op.value
+                }
+                res
+            }
+        )
+
+    /**
+     * 统一 GATT 操作模板：
+     * 1. 检查 gatt 是否就绪
+     * 2. 获取信号量
+     * 3. 检查 service/characteristic 有效性
+     * 4. 创建并执行操作
+     * 5. 用 try/finally 确保信号量释放和 mCurrentOperation 清理
+     */
+    private fun executeGattOperation(
+        serviceUUID: UUID?,
+        charaUUID: UUID?,
+        operationName: String,
+        preCheck: (BluetoothGatt, BluetoothGattService, BluetoothGattCharacteristic) -> BLECommOperation?,
+        resultTransformer: (BLECommOperation, BLECommOperationResult) -> BLECommOperationResult = { _, res -> res }
+    ): BLECommOperationResult {
+
+        val retValue = BLECommOperationResult()
+        val gatt = bluetoothConnectionGatt ?: run {
+            logError(LTag.PUMPBTCOMM, "$operationName: not configured!")
             retValue.resultCode = BLECommOperationResult.RESULT_NOT_CONFIGURED
             return retValue
         }
-        retValue.value = value
+
         gattOperationSema.acquire()
-        SystemClock.sleep(1) // attempting to yield thread, to make sequence of events easier to follow
-        if (mCurrentOperation != null) retValue.resultCode = BLECommOperationResult.RESULT_BUSY
-        else {
-            if (bluetoothConnectionGatt?.getService(serviceUUID) == null) {
-                // Catch if the service is not supported by the BLE device
-                // GGW: Tue Jul 12 01:14:01 UTC 2016: This can also happen if the
-                // app that created the bluetoothConnectionGatt has been destroyed/created,
-                // e.g. when the user switches from portrait to landscape.
-                retValue.resultCode = BLECommOperationResult.RESULT_NONE
-                aapsLogger.error(LTag.PUMPBTCOMM, "BT Device not supported")
-                // TODO: 11/07/2016 UI update for user
-                // xyz rileyLinkServiceData.setServiceState(RileyLinkServiceState.BluetoothError, RileyLinkError.NoBluetoothAdapter);
-            } else {
-                bluetoothConnectionGatt?.let { bluetoothConnectionGatt ->
-                    val chara = bluetoothConnectionGatt.getService(serviceUUID)?.getCharacteristic(charaUUID) ?: return retValue.apply { resultCode = BLECommOperationResult.RESULT_NOT_CONFIGURED }
-                    mCurrentOperation = CharacteristicWriteOperation(aapsLogger, bluetoothConnectionGatt, chara, value)
-                    mCurrentOperation?.execute(this)
-                    when {
-                        mCurrentOperation?.timedOut == true    -> retValue.resultCode = BLECommOperationResult.RESULT_TIMEOUT
-                        mCurrentOperation?.interrupted == true -> retValue.resultCode = BLECommOperationResult.RESULT_INTERRUPTED
-                        else                                   -> retValue.resultCode = BLECommOperationResult.RESULT_SUCCESS
-                    }
-                }
+        // yield hint
+        SystemClock.sleep(YIELD_SLEEP_MS)
+
+        try {
+            if (mCurrentOperation != null) {
+                retValue.resultCode = BLECommOperationResult.RESULT_BUSY
+                return retValue
             }
+
+            val service = gatt.getService(serviceUUID)
+            if (service == null) {
+                logError(LTag.PUMPBTCOMM, "BT Device not supported (service not found)")
+                retValue.resultCode = BLECommOperationResult.RESULT_NONE
+                return retValue
+            }
+
+            val characteristic = service.getCharacteristic(charaUUID)
+            if (characteristic == null) {
+                logError(LTag.PUMPBTCOMM, "Characteristic not found for $operationName")
+                retValue.resultCode = BLECommOperationResult.RESULT_NOT_CONFIGURED
+                return retValue
+            }
+
+            val operation = preCheck(gatt, service, characteristic)
+            if (operation == null) {
+                retValue.resultCode = BLECommOperationResult.RESULT_NONE
+                return retValue
+            }
+
+            mCurrentOperation = operation
+            operation.execute(this)
+
+            retValue.resultCode = when {
+                operation.timedOut -> BLECommOperationResult.RESULT_TIMEOUT
+                operation.interrupted -> BLECommOperationResult.RESULT_INTERRUPTED
+                else -> BLECommOperationResult.RESULT_SUCCESS
+            }
+
+            return resultTransformer(operation, retValue)
+
+        } finally {
             mCurrentOperation = null
             gattOperationSema.release()
         }
-        return retValue
     }
 
-    fun readCharacteristicBlocking(serviceUUID: UUID?, charaUUID: UUID?): BLECommOperationResult {
-        val retValue = BLECommOperationResult()
-        if (bluetoothConnectionGatt == null) {
-            aapsLogger.error(LTag.PUMPBTCOMM, "readCharacteristic_blocking: not configured!")
-            retValue.resultCode = BLECommOperationResult.RESULT_NOT_CONFIGURED
-            return retValue
-        }
+    // endregion
 
-        gattOperationSema.acquire()
-        SystemClock.sleep(1) // attempting to yield thread, to make sequence of events easier to follow
-        if (mCurrentOperation != null) retValue.resultCode = BLECommOperationResult.RESULT_BUSY
-        else {
-            if (bluetoothConnectionGatt?.getService(serviceUUID) == null) {
-                // Catch if the service is not supported by the BLE device
-                retValue.resultCode = BLECommOperationResult.RESULT_NONE
-                aapsLogger.error(LTag.PUMPBTCOMM, "BT Device not supported")
-                // TODO: 11/07/2016 UI update for user
-                // xyz rileyLinkServiceData.setServiceState(RileyLinkServiceState.BluetoothError, RileyLinkError.NoBluetoothAdapter);
-            } else {
-                val chara = bluetoothConnectionGatt?.getService(serviceUUID)?.getCharacteristic(charaUUID) ?: return retValue.apply { resultCode = BLECommOperationResult.RESULT_NOT_CONFIGURED }
-                mCurrentOperation = CharacteristicReadOperation(aapsLogger, bluetoothConnectionGatt!!, chara)
-                mCurrentOperation?.execute(this)
-                when {
-                    mCurrentOperation?.timedOut == true    -> retValue.resultCode = BLECommOperationResult.RESULT_TIMEOUT
-                    mCurrentOperation?.interrupted == true -> retValue.resultCode = BLECommOperationResult.RESULT_INTERRUPTED
+    // region GATT Callback
 
-                    else                                   -> {
-                        retValue.resultCode = BLECommOperationResult.RESULT_SUCCESS
-                        retValue.value = mCurrentOperation?.value
-                    }
-                }
-            }
-        }
-        mCurrentOperation = null
-        gattOperationSema.release()
+    private fun createGattCallback(): BluetoothGattCallback {
+        return object : BluetoothGattCallback() {
 
-        return retValue
-    }
-
-    private fun getGattStatusMessage(status: Int): String =
-        when (status) {
-            BluetoothGatt.GATT_SUCCESS             -> "SUCCESS"
-            BluetoothGatt.GATT_FAILURE             -> "FAILED"
-            BluetoothGatt.GATT_WRITE_NOT_PERMITTED -> "NOT PERMITTED"
-            133                                    -> "Found the strange 133 bug"
-            else                                   -> "UNKNOWN ($status)"
-        }
-
-    init {
-        //orangeLink.rileyLinkBLE = this;
-        bluetoothGattCallback = object : BluetoothGattCallback() {
-            @Suppress("DEPRECATION", "OVERRIDE_DEPRECATION")
+            @Suppress("OVERRIDE_DEPRECATION")
             override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
                 super.onCharacteristicChanged(gatt, characteristic)
-                if (gattDebugEnabled) {
-                    aapsLogger.debug(LTag.PUMPBTCOMM, "${ThreadUtil.sig()}onCharacteristicChanged ${GattAttributes.lookup(characteristic.uuid)} ${ByteUtil.getHex(characteristic.value)}")
-                    if (characteristic.uuid == UUID.fromString(GattAttributes.CHARA_RADIO_RESPONSE_COUNT))
-                        aapsLogger.debug(LTag.PUMPBTCOMM, "Response Count is " + ByteUtil.shortHexString(characteristic.value))
+                logGattDebug {
+                    "${ThreadUtil.sig()}onCharacteristicChanged ${GattAttributes.lookup(characteristic.uuid)} ${ByteUtil.getHex(characteristic.value)}"
                 }
-                if (characteristic.uuid == UUID.fromString(GattAttributes.CHARA_RADIO_RESPONSE_COUNT))
+                if (characteristic.uuid == UUID.fromString(GattAttributes.CHARA_RADIO_RESPONSE_COUNT)) {
+                    logGattDebug { "Response Count is ${ByteUtil.shortHexString(characteristic.value)}" }
                     radioResponseCountNotified?.run()
+                }
                 orangeLink.onCharacteristicChanged(characteristic, characteristic.value)
             }
 
-            @Suppress("OVERRIDE_DEPRECATION", "DEPRECATION")
+            @Suppress("OVERRIDE_DEPRECATION")
             override fun onCharacteristicRead(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
                 super.onCharacteristicRead(gatt, characteristic, status)
-                val statusMessage = getGattStatusMessage(status)
-                if (gattDebugEnabled)
-                    aapsLogger.debug(LTag.PUMPBTCOMM, "${ThreadUtil.sig()}onCharacteristicRead (${GattAttributes.lookup(characteristic.uuid)}) $statusMessage:${ByteUtil.getHex(characteristic.value)}")
+                logGattDebug {
+                    "${ThreadUtil.sig()}onCharacteristicRead (${GattAttributes.lookup(characteristic.uuid)}) ${gattStatusMessage(status)}:${ByteUtil.getHex(characteristic.value)}"
+                }
                 mCurrentOperation?.gattOperationCompletionCallback(characteristic.uuid, characteristic.value)
             }
 
-            @Suppress("DEPRECATION")
             override fun onCharacteristicWrite(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
                 super.onCharacteristicWrite(gatt, characteristic, status)
-                val uuidString = GattAttributes.lookup(characteristic.uuid)
-                if (gattDebugEnabled)
-                    aapsLogger.debug(LTag.PUMPBTCOMM, "${ThreadUtil.sig()}onCharacteristicWrite ${getGattStatusMessage(status)} $uuidString ${ByteUtil.shortHexString(characteristic.value)}")
+                logGattDebug {
+                    "${ThreadUtil.sig()}onCharacteristicWrite ${gattStatusMessage(status)} ${GattAttributes.lookup(characteristic.uuid)} ${ByteUtil.shortHexString(characteristic.value)}"
+                }
                 mCurrentOperation?.gattOperationCompletionCallback(characteristic.uuid, characteristic.value)
             }
 
             override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
                 super.onConnectionStateChange(gatt, status, newState)
 
-                // https://github.com/NordicSemiconductor/puck-central-android/blob/master/PuckCentral/app/src/main/java/no/nordicsemi/puckcentral/bluetooth/gatt/GattManager.java#L117
-                if (status == 133) {
-                    aapsLogger.error(LTag.PUMPBTCOMM, "Got the status 133 bug, closing gatt")
+                if (status == GATT_STATUS_STRANGE_BUG) {
+                    logError(LTag.PUMPBTCOMM, "Got the status 133 bug, closing gatt")
                     disconnect()
-                    SystemClock.sleep(500)
+                    SystemClock.sleep(DISCONNECT_CLOSE_DELAY_MS)
                     return
                 }
-                if (gattDebugEnabled) {
-                    val stateMessage: String = when (newState) {
-                        BluetoothProfile.STATE_CONNECTED     -> "CONNECTED"
-                        BluetoothProfile.STATE_CONNECTING    -> "CONNECTING"
-                        BluetoothProfile.STATE_DISCONNECTED  -> "DISCONNECTED"
-                        BluetoothProfile.STATE_DISCONNECTING -> "DISCONNECTING"
-                        else                                 -> "UNKNOWN newState ($newState)"
+
+                logGattDebug { "onConnectionStateChange ${gattStatusMessage(status)} ${connectionStateMessage(newState)}" }
+
+                when (newState) {
+                    BluetoothProfile.STATE_CONNECTED -> {
+                        if (status == BluetoothGatt.GATT_SUCCESS) {
+                            rileyLinkUtil.sendBroadcastMessage(RileyLinkConst.Intents.BluetoothConnected)
+                        } else {
+                            logDebug(LTag.PUMPBTCOMM, "BT State connected, GATT status $status (${gattStatusMessage(status)})")
+                        }
                     }
 
-                    aapsLogger.warn(LTag.PUMPBTCOMM, "onConnectionStateChange " + getGattStatusMessage(status) + " " + stateMessage)
-                }
-                if (newState == BluetoothProfile.STATE_CONNECTED) {
-                    if (status == BluetoothGatt.GATT_SUCCESS) rileyLinkUtil.sendBroadcastMessage(RileyLinkConst.Intents.BluetoothConnected)
-                    else aapsLogger.debug(LTag.PUMPBTCOMM, "BT State connected, GATT status $status (${getGattStatusMessage(status)})")
-                } else if (newState == BluetoothProfile.STATE_CONNECTING || newState == BluetoothProfile.STATE_DISCONNECTING) {
-                    aapsLogger.debug(LTag.PUMPBTCOMM, "We are in ${if (status == BluetoothProfile.STATE_CONNECTING) "Connecting" else "Disconnecting"} state.")
-                } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                    rileyLinkUtil.sendBroadcastMessage(RileyLinkConst.Intents.RileyLinkDisconnected)
-                    if (manualDisconnect) close()
-                    aapsLogger.warn(LTag.PUMPBTCOMM, "RileyLink Disconnected.")
-                } else {
-                    aapsLogger.warn(LTag.PUMPBTCOMM, String.format(Locale.ENGLISH, "Some other state: (status=%d, newState=%d)", status, newState))
+                    BluetoothProfile.STATE_CONNECTING, BluetoothProfile.STATE_DISCONNECTING -> {
+                        logDebug(LTag.PUMPBTCOMM, "We are in ${if (newState == BluetoothProfile.STATE_CONNECTING) "Connecting" else "Disconnecting"} state.")
+                    }
+
+                    BluetoothProfile.STATE_DISCONNECTED -> {
+                        rileyLinkUtil.sendBroadcastMessage(RileyLinkConst.Intents.RileyLinkDisconnected)
+                        if (manualDisconnect) close()
+                        logWarn(LTag.PUMPBTCOMM, "RileyLink Disconnected.")
+                    }
+
+                    else -> {
+                        logWarn(LTag.PUMPBTCOMM, String.format(Locale.ENGLISH, "Some other state: (status=%d, newState=%d)", status, newState))
+                    }
                 }
             }
 
-            @Suppress("DEPRECATION")
             override fun onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
                 super.onDescriptorWrite(gatt, descriptor, status)
-                if (gattDebugEnabled)
-                    aapsLogger.warn(LTag.PUMPBTCOMM, "onDescriptorWrite ${GattAttributes.lookup(descriptor.uuid)} ${getGattStatusMessage(status)} written: ${ByteUtil.getHex(descriptor.value)}")
+                logGattDebug {
+                    "onDescriptorWrite ${GattAttributes.lookup(descriptor.uuid)} ${gattStatusMessage(status)} written: ${ByteUtil.getHex(descriptor.value)}"
+                }
                 mCurrentOperation?.gattOperationCompletionCallback(descriptor.uuid, descriptor.value)
             }
 
-            @Suppress("OVERRIDE_DEPRECATION", "DEPRECATION")
+            @Suppress("OVERRIDE_DEPRECATION")
             override fun onDescriptorRead(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
                 super.onDescriptorRead(gatt, descriptor, status)
                 mCurrentOperation?.gattOperationCompletionCallback(descriptor.uuid, descriptor.value)
-                if (gattDebugEnabled)
-                    aapsLogger.warn(LTag.PUMPBTCOMM, "onDescriptorRead " + getGattStatusMessage(status) + " status " + descriptor)
+                logGattDebug { "onDescriptorRead ${gattStatusMessage(status)} status $descriptor" }
             }
 
             override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
                 super.onMtuChanged(gatt, mtu, status)
-                if (gattDebugEnabled)
-                    aapsLogger.warn(LTag.PUMPBTCOMM, "onMtuChanged $mtu status $status")
+                logGattDebug { "onMtuChanged $mtu status $status" }
             }
 
             override fun onReadRemoteRssi(gatt: BluetoothGatt, rssi: Int, status: Int) {
                 super.onReadRemoteRssi(gatt, rssi, status)
-                if (gattDebugEnabled)
-                    aapsLogger.warn(LTag.PUMPBTCOMM, "onReadRemoteRssi " + getGattStatusMessage(status) + ": " + rssi)
+                logGattDebug { "onReadRemoteRssi ${gattStatusMessage(status)}: $rssi" }
             }
 
             override fun onReliableWriteCompleted(gatt: BluetoothGatt, status: Int) {
                 super.onReliableWriteCompleted(gatt, status)
-                if (gattDebugEnabled)
-                    aapsLogger.warn(LTag.PUMPBTCOMM, "onReliableWriteCompleted status $status")
+                logGattDebug { "onReliableWriteCompleted status $status" }
             }
 
             override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
                 super.onServicesDiscovered(gatt, status)
                 if (status == BluetoothGatt.GATT_SUCCESS) {
-                    val services = gatt.services
-                    var rileyLinkFound = false
                     orangeLink.resetOrangeLinkData()
-                    val stringBuilder = StringBuilder("RileyLink Device Debug\n")
-                    for (service in services) {
-                        val uuidService = service.uuid
+                    val sb = StringBuilder("RileyLink Device Debug\n")
+                    var rileyLinkFound = false
+
+                    for (service in gatt.services) {
                         if (isAnyRileyLinkServiceFound(service)) {
                             rileyLinkFound = true
                         }
                         if (gattDebugEnabled) {
-                            debugService(service, 0, stringBuilder)
+                            debugService(service, 0, sb)
                         }
-                        orangeLink.checkIsOrange(uuidService)
+                        orangeLink.checkIsOrange(service.uuid)
                     }
-                    if (gattDebugEnabled) {
-                        aapsLogger.warn(LTag.PUMPBTCOMM, stringBuilder.toString())
-                        aapsLogger.warn(LTag.PUMPBTCOMM, "onServicesDiscovered " + getGattStatusMessage(status))
-                    }
-                    aapsLogger.info(LTag.PUMPBTCOMM, "Gatt device is RileyLink device: $rileyLinkFound")
+
+                    logGattDebug { sb.toString() }
+                    logGattDebug { "onServicesDiscovered ${gattStatusMessage(status)}" }
+                    logInfo(LTag.PUMPBTCOMM, "Gatt device is RileyLink device: $rileyLinkFound")
+
                     if (rileyLinkFound) {
                         isConnected = true
                         rileyLinkUtil.sendBroadcastMessage(RileyLinkConst.Intents.RileyLinkReady)
@@ -475,10 +457,70 @@ class RileyLinkBLE @Inject constructor(
                         )
                     }
                 } else {
-                    aapsLogger.debug(LTag.PUMPBTCOMM, "onServicesDiscovered " + getGattStatusMessage(status))
+                    logDebug(LTag.PUMPBTCOMM, "onServicesDiscovered ${gattStatusMessage(status)}")
                     rileyLinkUtil.sendBroadcastMessage(RileyLinkConst.Intents.RileyLinkGattFailed)
                 }
             }
         }
     }
+
+    // endregion
+
+    // region Helpers
+
+    private fun isAnyRileyLinkServiceFound(service: BluetoothGattService): Boolean {
+        if (GattAttributes.isRileyLink(service.uuid)) return true
+        for (included in service.includedServices) {
+            if (isAnyRileyLinkServiceFound(included)) return true
+            orangeLink.checkIsOrange(included.uuid)
+        }
+        return false
+    }
+
+    private fun debugService(service: BluetoothGattService, indentCount: Int, sb: StringBuilder) {
+        if (!gattDebugEnabled) return
+        val indent = StringUtils.repeat(' ', indentCount)
+        val uuidStr = service.uuid.toString()
+        sb.append(indent)
+            .append(GattAttributes.lookup(uuidStr, "Unknown service"))
+            .append(" ($uuidStr)")
+        for (chara in service.characteristics) {
+            sb.append("\n    ").append(indent)
+                .append("- ").append(GattAttributes.lookup(chara.uuid.toString(), "Unknown Characteristic"))
+                .append(" (${chara.uuid})")
+        }
+        sb.append("\n\n")
+        for (included in service.includedServices) {
+            debugService(included, indentCount + 4, sb)
+        }
+    }
+
+    private fun gattStatusMessage(status: Int): String = when (status) {
+        BluetoothGatt.GATT_SUCCESS -> "SUCCESS"
+        BluetoothGatt.GATT_FAILURE -> "FAILED"
+        BluetoothGatt.GATT_WRITE_NOT_PERMITTED -> "NOT PERMITTED"
+        GATT_STATUS_STRANGE_BUG -> "Found the strange 133 bug"
+        else -> "UNKNOWN ($status)"
+    }
+
+    private fun connectionStateMessage(state: Int): String = when (state) {
+        BluetoothProfile.STATE_CONNECTED -> "CONNECTED"
+        BluetoothProfile.STATE_CONNECTING -> "CONNECTING"
+        BluetoothProfile.STATE_DISCONNECTED -> "DISCONNECTED"
+        BluetoothProfile.STATE_DISCONNECTING -> "DISCONNECTING"
+        else -> "UNKNOWN ($state)"
+    }
+
+    // region Logging helpers (converge gattDebugEnabled check)
+    private fun logGattDebug(messageProvider: () -> String) {
+        if (gattDebugEnabled) aapsLogger.debug(LTag.PUMPBTCOMM, messageProvider())
+    }
+
+    private fun logDebug(tag: LTag, message: String) = aapsLogger.debug(tag, message)
+    private fun logWarn(tag: LTag, message: String) = aapsLogger.warn(tag, message)
+    private fun logError(tag: LTag, message: String) = aapsLogger.error(tag, message)
+    private fun logInfo(tag: LTag, message: String) = aapsLogger.info(tag, message)
+    // endregion
+
+    // endregion
 }

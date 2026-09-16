@@ -40,12 +40,8 @@ import java.util.UUID
 import java.util.concurrent.Semaphore
 import javax.inject.Inject
 import javax.inject.Singleton
-import android.bluetooth.BluetoothManager
-import kotlinx.coroutines.*
-import kotlinx.coroutines.flow.consumeAsFlow
-import java.util.concurrent.TimeUnit
 
- /**
+/**
  * Created by geoff on 5/26/16.
  * Added: State handling, configuration of RF for different configuration ranges, connection handling
  */
@@ -486,82 +482,3 @@ class RileyLinkBLE @Inject constructor(
         }
     }
 }
-
-  // ========== 新增补丁开始 完全不碰原有代码 ==========
-    private val ioSafeScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-    private var linkWatchdog: Job? = null
-    private var reconnectBackoffJob: Job? = null
-
-    @Volatile
-    private var lastValidPacketReceivedAt = System.currentTimeMillis()
-    private val baseReconnectDelayMs = 1000L
-    private val maxReconnectDelayMs = 30000L
-    private var currentBackoffDelay = baseReconnectDelayMs
-
-    // 你原文件里的 onCharacteristicChanged 方法末尾直接加这行，不用改原有接收逻辑
-    private fun markPacketAsFresh() {
-        lastValidPacketReceivedAt = System.currentTimeMillis()
-    }
-
-    // 原有连接成功后调用的 onServicesDiscovered 末尾，直接启动看门狗
-    private fun startStableConnectionWatchdog() {
-        stopWatchdogSafely()
-        lastValidPacketReceivedAt = System.currentTimeMillis()
-
-        linkWatchdog = ioSafeScope.launch {
-            while (isActive) {
-                delay(5000) // 每5秒巡检一次链路
-                val silentMillis = System.currentTimeMillis() - lastValidPacketReceivedAt
-
-                // 超过15秒无任何数据返回，判定静默断连
-                if (silentMillis > 15000) {
-                    val linkAlive = runCatching {
-                        withTimeout(3000) {
-                            // 直接复用你原有源码里的 tiny 空指令探测方法，零新增逻辑
-                            device?.writeTxChar(byteArrayOf(0x00))
-                            // 等2秒内有任何回应就说明链路正常
-                            rxtxBus.toFlowable().timeout(2, TimeUnit.SECONDS).blockingFirst()
-                            true
-                        }
-                    }.getOrElse { false }
-
-                    if (!linkAlive) {
-                        aapsLogger.error(LTag.PUMPBTCOMM, "RileyLink 静默断连触发，主动重置链路")
-                        triggerAutoReconnectFlow()
-                        break
-                    }
-                }
-            }
-        }
-    }
-
-    private fun stopWatchdogSafely() {
-        linkWatchdog?.cancel()
-        linkWatchdog = null
-    }
-
-    // 指数退避重连逻辑，完全复用你原有 connect 方法
-    private fun triggerAutoReconnectFlow() {
-        stopWatchdogSafely()
-        disconnect() // 调用原有官方断连逻辑，清理Gatt资源
-
-        reconnectBackoffJob?.cancel()
-        reconnectBackoffJob = ioSafeScope.launch {
-            delay(currentBackoffDelay)
-            // 自动重连地址复用原有官方已配对设备，不用写新逻辑
-            context.getSystemService(BluetoothManager::class.java).adapter.bondedDevices
-                .firstOrNull { it.name?.startsWith("RileyLink") == true }
-                ?.let { connect(it) }
-
-            // 指数退避，不会疯狂刷屏连蓝牙
-            currentBackoffDelay = (currentBackoffDelay * 2).coerceAtMost(maxReconnectDelayMs)
-        }
-    }
-
-    // 原有手动断开连接的方法里，补上清理定时器逻辑
-    private fun stopAllAutoJobs() {
-        stopWatchdogSafely()
-        reconnectBackoffJob?.cancel()
-        currentBackoffDelay = baseReconnectDelayMs
-    }
-    // ========== 新增补丁结束 ==========

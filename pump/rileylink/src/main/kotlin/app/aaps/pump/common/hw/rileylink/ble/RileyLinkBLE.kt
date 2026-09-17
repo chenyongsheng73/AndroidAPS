@@ -81,6 +81,19 @@ class RileyLinkBLE @Inject constructor(
     //val bluetoothAdapter: BluetoothAdapter = BluetoothAdapter.getDefaultAdapter()
     val bluetoothAdapter: BluetoothAdapter? get() = (context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager?)?.adapter
     private val bluetoothGattCallback: BluetoothGattCallback
+
+    /**
+     * True when a disconnect was triggered intentionally by the user / upper layer
+     * (e.g. change of pump, manual stop). While set, the auto-reconnect machinery
+     * must NOT fight it and should bail out / clear its back-off state.
+     *
+     * Set to true around deliberate [disconnect] / [close], and reset to false
+     * when an explicit [connectGatt] / [connect] is requested. This is what
+     * distinguishes "expected disconnect" from "unexpected link loss" so that
+     * the latter can safely auto-reconnect.
+     */
+    private var manualDisconnect = false
+
     var rileyLinkDevice: BluetoothDevice? = null
     private var bluetoothConnectionGatt: BluetoothGatt? = null
     private var mCurrentOperation: BLECommOperation? = null

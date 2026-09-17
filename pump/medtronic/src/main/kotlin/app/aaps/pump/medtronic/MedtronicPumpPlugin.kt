@@ -103,6 +103,7 @@ import app.aaps.pump.medtronic.service.RileyLinkMedtronicService
 import app.aaps.pump.medtronic.util.MedtronicUtil
 import app.aaps.pump.medtronic.util.MedtronicUtil.Companion.isSame
 import app.aaps.pump.medtronic.driver.MedtronicPumpDriverConfiguration
+import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import org.joda.time.LocalDateTime
 import java.util.Calendar
 import java.util.GregorianCalendar
@@ -215,7 +216,18 @@ class MedtronicPumpPlugin @Inject constructor(
                 .observeOn(aapsSchedulers.io)
                 .subscribe({ event: EventRileyLinkDeviceStatusChange -> rxBus.send(EventSWRLStatus(event.getStatus(context))) }, fabricPrivacy::logException)
         )
+        registerConnectionRecoveryReceiver()
         super.onStart()
+    }
+
+    /**
+     * (New) Lifecycle counterpart: unregister the recovery receiver and cancel any pending
+     * reconnect when the plugin is stopped, so we don't leak the broadcast registration.
+     * Preserves the pre-existing onStart() contract (no override of onStop existed before).
+     */
+    override fun onStop() {
+        unregisterConnectionRecoveryReceiver()
+        super.onStop()
     }
 
     override fun updatePreferenceSummary(pref: Preference) {
@@ -324,6 +336,124 @@ class MedtronicPumpPlugin @Inject constructor(
         }
         if (deleteFromQueue.isNotEmpty()) {
             busyTimestamps.removeAll(deleteFromQueue)
+        }
+    }
+
+    // =============================================================================================
+    //  Connection recovery (new, non-breaking): observe RileyLink framework intents and react to
+    //  link loss by (re)starting the BLE reconnect + Wake & Tune sequence. This works in concert
+    //  with the autonomous reconnect in RileyLinkBLE / RileyLinkMedtronicService to fix the
+    //  "connection never comes back" failure mode (AAPS issue #2121).
+    // =============================================================================================
+
+    /** True while we're waiting for a link-restored -> wake-and-tune cycle to complete. */
+    private var connectionRecoveryInProgress = false
+
+    private val connectionRecoveryReceiver = object : android.content.BroadcastReceiver() {
+        override fun onReceive(ctx: android.content.Context?, intent: Intent?) {
+            when (intent?.action) {
+                RileyLinkConst.Intents.RileyLinkDisconnected,
+                RileyLinkConst.Intents.RileyLinkGattFailed -> {
+                    if (!connectionRecoveryInProgress) {
+                        aapsLogger.warn(LTag.PUMP, "Connection recovery: ${intent.action} -> triggerReconnect()")
+                        triggerReconnect()
+                    }
+                }
+                // Catch the system-level Bluetooth adapter turning back on (covers the case where
+                // BT was toggled off then on, and also devices where the framework "BluetoothReconnected"
+                // intent is not delivered). We react to STATE_ON.
+                BluetoothAdapter.ACTION_STATE_CHANGED -> {
+                    val state = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)
+                    if (state == BluetoothAdapter.STATE_ON && !connectionRecoveryInProgress) {
+                        aapsLogger.warn(LTag.PUMP, "Connection recovery: BT adapter STATE_ON -> triggerReconnect()")
+                        triggerReconnect()
+                    }
+                }
+                RileyLinkConst.Intents.RileyLinkReady -> {
+                    // Link fully restored: run a Wake & Tune so the pump RF side is reacquired.
+                    if (connectionRecoveryInProgress) {
+                        aapsLogger.warn(LTag.PUMP, "Connection recovery: RileyLinkReady -> Wake & Tune.")
+                        connectionRecoveryInProgress = false
+                        runWakeAndTuneIfNeeded()
+                    }
+                }
+                RileyLinkConst.Intents.RileyLinkNewAddressSet -> {
+                    // A new address was selected (config change) -- let the framework drive it,
+                    // but make sure our recovery state is reset.
+                    connectionRecoveryInProgress = false
+                }
+            }
+        }
+    }
+
+    private var connectionRecoveryReceiverRegistered = false
+
+    @Synchronized
+    private fun registerConnectionRecoveryReceiver() {
+        if (connectionRecoveryReceiverRegistered) return
+        // Framework-local intents (LocalBroadcastManager) for RileyLink link-state changes...
+        val frameworkActions = arrayOf(
+            RileyLinkConst.Intents.RileyLinkDisconnected,
+            RileyLinkConst.Intents.RileyLinkGattFailed,
+            RileyLinkConst.Intents.RileyLinkReady,
+            RileyLinkConst.Intents.RileyLinkNewAddressSet
+        )
+        val frameworkFilter = android.content.IntentFilter().apply { for (a in frameworkActions) addAction(a) }
+        LocalBroadcastManager.getInstance(context).registerReceiver(connectionRecoveryReceiver, frameworkFilter)
+
+        // ...plus the system Bluetooth state broadcast (Context-registered, since it's a system action).
+        val systemFilter = android.content.IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED)
+        context.registerReceiver(connectionRecoveryReceiver, systemFilter)
+        connectionRecoveryReceiverRegistered = true
+    }
+
+    @Synchronized
+    private fun unregisterConnectionRecoveryReceiver() {
+        if (!connectionRecoveryReceiverRegistered) return
+        // Match register order: LocalBroadcastManager first, then the system-registered receiver.
+        try {
+            LocalBroadcastManager.getInstance(context).unregisterReceiver(connectionRecoveryReceiver)
+        } catch (t: Throwable) {
+            aapsLogger.error(LTag.PUMP, "LBM unregister failed: ${t.message}")
+        }
+        try {
+            context.unregisterReceiver(connectionRecoveryReceiver)
+        } catch (t: Throwable) {
+            aapsLogger.error(LTag.PUMP, "context unregisterReceiver failed: ${t.message}")
+        }
+        connectionRecoveryReceiverRegistered = false
+    }
+
+    /**
+     * Kicks the BLE layer's autonomous reconnect. Idempotent -- safe to call on every disconnect
+     * event. Once the link reports ready, the broadcast path above will run Wake & Tune.
+     *
+     * Implementation note: reconnection is driven entirely through the existing framework broadcast
+     * contract (RileyLinkNewAddressSet / BluetoothConnected), so this plugin layer never reaches
+     * into RileyLinkService / RileyLinkBLE internals -- keeping it robust against base-class changes.
+     */
+    private fun triggerReconnect() {
+        if (connectionRecoveryInProgress) return
+        connectionRecoveryInProgress = true
+        try {
+            // This is the same intent the framework already uses to (re)connect to the RL device,
+            // so it cleanly integrates with the existing state machine in RileyLinkService.
+            rileyLinkUtil.sendBroadcastMessage(RileyLinkConst.Intents.RileyLinkNewAddressSet)
+        } catch (t: Throwable) {
+            aapsLogger.error(LTag.PUMP, "triggerReconnect failed: ${t.message}")
+            connectionRecoveryInProgress = false
+        }
+    }
+
+    /** Run a Wake & Tune to reacquire the pump RF channel after the BLE link is restored. */
+    private fun runWakeAndTuneIfNeeded() {
+        try {
+            // Reuse the existing Wake & Tune task infrastructure already wired in this plugin
+            // (same call site used by initializePump()). serviceTaskExecutor is the injected
+            // ServiceTaskExecutor; wakeAndTuneTaskProvider supplies the task.
+            serviceTaskExecutor.startTask(wakeAndTuneTaskProvider.get())
+        } catch (t: Throwable) {
+            aapsLogger.error(LTag.PUMP, "runWakeAndTuneIfNeeded failed: ${t.message}")
         }
     }
 

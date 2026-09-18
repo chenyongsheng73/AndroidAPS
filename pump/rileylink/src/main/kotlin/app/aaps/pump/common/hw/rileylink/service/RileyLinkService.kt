@@ -164,11 +164,5 @@ abstract class RileyLinkService : DaggerService() {
     }
 
     abstract fun verifyConfiguration(forceRileyLinkAddressRenewal: Boolean): Boolean
-         val ok = super.verifyConfiguration(force)
-    if (ok) {
-        // ★ 修正：重连/验证成功后强制回 Ready
-        rileyLinkServiceData.rileyLinkServiceState = RileyLinkServiceState.RileyLinkReady
-        log("✅ Pump verified → RileyLinkReady")
-    }
-    return ok
+      
  }

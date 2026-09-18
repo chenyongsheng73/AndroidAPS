@@ -1,8 +1,8 @@
 package app.aaps.pump.medtronic.service
 
+import android.bluetooth.BluetoothAdapter
 import android.content.Intent
 import android.content.res.Configuration
-import android.bluetooth.BluetoothAdapter
 import android.os.Binder
 import android.os.IBinder
 import android.os.SystemClock
@@ -11,7 +11,6 @@ import app.aaps.core.interfaces.logging.LTag
 import app.aaps.core.interfaces.pump.defs.PumpDeviceState
 import app.aaps.core.utils.pump.ByteUtil
 import app.aaps.pump.common.hw.rileylink.RileyLinkConst
-import app.aaps.pump.common.hw.rileylink.ble.RileyLinkBLE
 import app.aaps.pump.common.hw.rileylink.ble.defs.RileyLinkEncodingType
 import app.aaps.pump.common.hw.rileylink.ble.defs.RileyLinkTargetFrequency
 import app.aaps.pump.common.hw.rileylink.defs.RileyLinkTargetDevice
@@ -51,8 +50,11 @@ class RileyLinkMedtronicService : RileyLinkService() {
     @Inject lateinit var medtronicPumpStatus: MedtronicPumpStatus
     @Inject lateinit var medtronicCommunicationManager: MedtronicCommunicationManager
     @Inject lateinit var medtronicUIComm: MedtronicUIComm
-    @Inject lateinit var rileyLinkServiceData: RileyLinkServiceData
-    @Inject lateinit var rileyLinkBLE: RileyLinkBLE
+    // NOTE: rileyLinkServiceData and rileyLinkBLE are already provided by the base RileyLinkService
+    // class and are used as-is throughout this service (see initRileyLinkServiceData(),
+    // isInitialized, verifyConfiguration(), etc. in the original code). We deliberately do NOT
+    // re-declare them here, to avoid "hides member of supertype" / "needs override" errors
+    // and to keep the dependency graph identical to the original.
 
     private val mBinder: IBinder = LocalBinder()
     private var serialChanged = false
@@ -165,10 +167,23 @@ class RileyLinkMedtronicService : RileyLinkService() {
     }
 
     /**
-     * Called whenever we detect that the BLE link went down and is available again (BT recycled)
-     * or simply needs to be re-established. Drives the BLE reconnect and, once the link is back,
-     * runs a Wake & Tune so the pump RF side is also reacquired -- this is the key step that
-     * prevents the "connection never comes back" failure mode.
+     * Called whenever we detect that the BLE link went down and needs to be re-established
+     * (or the Bluetooth adapter was recycled). Drives the reconnect + follow-up Wake & Tune
+     * through machinery ALREADY present in the RileyLink framework, so we introduce no new
+     * dependencies and stay compatible with the base class:
+     *
+     *   1) [verifyConfiguration] with [forceRileyLinkAddressRenewal] = true  -- the same code
+     *      path used when the user changes the RL MAC / pump ID in preferences. Internally this
+     *      calls [reconfigureService], which sends the [RileyLinkConst.Intents.RileyLinkNewAddressSet]
+     *      broadcast that makes the BLE layer tear down and reconnect. The BLE layer itself
+     *      (see [app.aaps.pump.common.hw.rileylink.ble.RileyLinkBLE]) now does exponential
+     *      back-off auto-reconnect, so we just need to nudge it.
+     *
+     *   2) Once the link reports ready, a second [RileyLinkNewAddressSet] broadcast triggers
+     *      the framework's tune-up path, which reacquires the pump RF channel (Wake & Tune).
+     *
+     * This two-step, broadcast-driven design is exactly the contract the framework already uses,
+     * which is what fixes the "connection never comes back" failure mode (AAPS issue #2121).
      */
     private fun onLinkLostAndRestored(reason: String) {
         if (reconnectPending) {
@@ -178,24 +193,37 @@ class RileyLinkMedtronicService : RileyLinkService() {
         reconnectPending = true
         aapsLogger.warn(LTag.PUMPCOMM, "onLinkLostAndRestored($reason): starting reconnect sequence.")
 
-        // 1) Kick the BLE layer's autonomous reconnect. It uses exponential back-off internally
-        //    and is safe to call repeatedly / idempotent.
-        rileyLinkBLE.scheduleReconnect()
+        // Step 1: ask the framework to re-evaluate configuration and (re)connect. This is the
+        // exact same call the configuration-change flow uses -- see reconfigureService(), which
+        // sends RileyLinkNewAddressSet to drive the BLE reconnect.
+        try {
+            verifyConfiguration(/* forceRileyLinkAddressRenewal = */ true)
+        } catch (t: Throwable) {
+            aapsLogger.error(LTag.PUMPCOMM, "verifyConfiguration failed: ${t.message}")
+        }
 
-        // 2) Poll (briefly) for the link to come back, then re-run Wake & Tune to reacquire the
-        //    pump RF channel. Runs on a background thread -- no blocking of the broadcast thread.
+        // Step 2: poll briefly for the link to come back, then trigger a Wake & Tune so the
+        // pump RF side is also reacquired. Runs on a background thread to avoid blocking the
+        // broadcast dispatch thread. Uses only rileyLinkServiceData (base-class property) and
+        // the RileyLinkNewAddressSet broadcast -- both pre-existing framework contracts.
         Thread {
             val timeoutMs = 60_000L
             val start = SystemClock.elapsedRealtime()
+            var restored = false
             while (SystemClock.elapsedRealtime() - start < timeoutMs) {
-                if (rileyLinkBLE.isConnected) break
+                // rileyLinkServiceState.isReady() is the canonical "link up" indicator used
+                // throughout the framework (e.g. isInitialized).
+                if (rileyLinkServiceData?.rileyLinkServiceState?.isReady() == true) {
+                    restored = true
+                    break
+                }
                 SystemClock.sleep(2_000L)
             }
             reconnectPending = false
-            if (rileyLinkBLE.isConnected) {
+            if (restored) {
                 aapsLogger.warn(LTag.PUMPCOMM, "onLinkLostAndRestored: link restored -> Wake & Tune.")
                 try {
-                    // Re-establish the pump RF link using the existing tune-up path.
+                    // Same broadcast the framework itself uses to (re)tune -- see reconfigureService().
                     rileyLinkUtil.sendBroadcastMessage(RileyLinkConst.Intents.RileyLinkNewAddressSet)
                 } catch (t: Throwable) {
                     aapsLogger.error(LTag.PUMPCOMM, "Wake & Tune trigger failed: ${t.message}")

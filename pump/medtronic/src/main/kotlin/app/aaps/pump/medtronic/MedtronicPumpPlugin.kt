@@ -360,7 +360,7 @@ class MedtronicPumpPlugin @Inject constructor(
     private fun triggerReconnect(reason: String) {
         try {
             aapsLogger.warn(LTag.PUMP, "Connection recovery: $reason -> verifyConfiguration()")
-           verifyConfiguration(forceRileyLinkAddressRenewal = true)
+            rileyLinkMedtronicService?.verifyConfiguration(
                 // forceRileyLinkAddressRenewal = true so a link loss always triggers a fresh
                 // connect attempt rather than being treated as "nothing changed".
                 true

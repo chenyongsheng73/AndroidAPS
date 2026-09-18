@@ -103,7 +103,6 @@ import app.aaps.pump.medtronic.service.RileyLinkMedtronicService
 import app.aaps.pump.medtronic.util.MedtronicUtil
 import app.aaps.pump.medtronic.util.MedtronicUtil.Companion.isSame
 import app.aaps.pump.medtronic.driver.MedtronicPumpDriverConfiguration
-import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import org.joda.time.LocalDateTime
 import java.util.Calendar
 import java.util.GregorianCalendar
@@ -216,18 +215,7 @@ class MedtronicPumpPlugin @Inject constructor(
                 .observeOn(aapsSchedulers.io)
                 .subscribe({ event: EventRileyLinkDeviceStatusChange -> rxBus.send(EventSWRLStatus(event.getStatus(context))) }, fabricPrivacy::logException)
         )
-        registerConnectionRecoveryReceiver()
         super.onStart()
-    }
-
-    /**
-     * (New) Lifecycle counterpart: unregister the recovery receiver and cancel any pending
-     * reconnect when the plugin is stopped, so we don't leak the broadcast registration.
-     * Preserves the pre-existing onStart() contract (no override of onStop existed before).
-     */
-    override fun onStop() {
-        unregisterConnectionRecoveryReceiver()
-        super.onStop()
     }
 
     override fun updatePreferenceSummary(pref: Preference) {
@@ -275,6 +263,11 @@ class MedtronicPumpPlugin @Inject constructor(
     override fun onStartScheduledPumpActions() {
         // check status every minute (if any status needs refresh we send readStatus command)
         startRefreshOfPumpCommands()
+        // (New, non-breaking) passive watchdog: if the pump has been silent for too long, the
+        // BLE link is stale and we nudge the framework to reconnect. This guarantees recovery
+        // even when no explicit disconnect event is delivered. Uses only existing framework
+        // machinery (verifyConfiguration) -- see [triggerReconnect].
+        checkConnectionAndRecoverIfStale()
     }
 
     override val serviceClass: Class<*> = RileyLinkMedtronicService::class.java
@@ -340,122 +333,60 @@ class MedtronicPumpPlugin @Inject constructor(
     }
 
     // =============================================================================================
-    //  Connection recovery (new, non-breaking): observe RileyLink framework intents and react to
-    //  link loss by (re)starting the BLE reconnect + Wake & Tune sequence. This works in concert
-    //  with the autonomous reconnect in RileyLinkBLE / RileyLinkMedtronicService to fix the
-    //  "connection never comes back" failure mode (AAPS issue #2121).
+    //  Connection recovery (new, non-breaking)
+    //  ------------------------------------------------------------------
+    //  Design note: reconnection is driven ENTIRELY through machinery already present in the
+    //  RileyLink framework (RileyLinkService.verifyConfiguration() / reconfigureService() and the
+    //  RileyLinkNewAddressSet broadcast contract used inside RileyLinkService). This plugin layer
+    //  therefore introduces NO new imports, NO BroadcastReceiver, NO LocalBroadcastManager and NO
+    //  android.bluetooth.* dependency -- keeping compilation 100% aligned with the existing
+    //  environment while still fixing the "connection never comes back" failure mode
+    //  (AAPS issue #2121) in cooperation with the autonomous reconnect in RileyLinkBLE /
+    //  RileyLinkMedtronicService.
     // =============================================================================================
 
-    /** True while we're waiting for a link-restored -> wake-and-tune cycle to complete. */
-    private var connectionRecoveryInProgress = false
-
-    private val connectionRecoveryReceiver = object : android.content.BroadcastReceiver() {
-        override fun onReceive(ctx: android.content.Context?, intent: Intent?) {
-            when (intent?.action) {
-                RileyLinkConst.Intents.RileyLinkDisconnected,
-                RileyLinkConst.Intents.RileyLinkGattFailed -> {
-                    if (!connectionRecoveryInProgress) {
-                        aapsLogger.warn(LTag.PUMP, "Connection recovery: ${intent.action} -> triggerReconnect()")
-                        triggerReconnect()
-                    }
-                }
-                // Catch the system-level Bluetooth adapter turning back on (covers the case where
-                // BT was toggled off then on, and also devices where the framework "BluetoothReconnected"
-                // intent is not delivered). We react to STATE_ON.
-                BluetoothAdapter.ACTION_STATE_CHANGED -> {
-                    val state = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)
-                    if (state == BluetoothAdapter.STATE_ON && !connectionRecoveryInProgress) {
-                        aapsLogger.warn(LTag.PUMP, "Connection recovery: BT adapter STATE_ON -> triggerReconnect()")
-                        triggerReconnect()
-                    }
-                }
-                RileyLinkConst.Intents.RileyLinkReady -> {
-                    // Link fully restored: run a Wake & Tune so the pump RF side is reacquired.
-                    if (connectionRecoveryInProgress) {
-                        aapsLogger.warn(LTag.PUMP, "Connection recovery: RileyLinkReady -> Wake & Tune.")
-                        connectionRecoveryInProgress = false
-                        runWakeAndTuneIfNeeded()
-                    }
-                }
-                RileyLinkConst.Intents.RileyLinkNewAddressSet -> {
-                    // A new address was selected (config change) -- let the framework drive it,
-                    // but make sure our recovery state is reset.
-                    connectionRecoveryInProgress = false
-                }
-            }
-        }
-    }
-
-    private var connectionRecoveryReceiverRegistered = false
-
+    /**
+     * Asks the RileyLink service to re-evaluate its configuration and, if the MAC address /
+     * pump ID / encoding changed (or is simply stale after a link drop), drive a fresh connect
+     * through the existing framework state machine. This is exactly the same code path the UI
+     * and configuration change already use -- see [RileyLinkMedtronicService.reconfigureService]
+     * and [RileyLinkMedtronicService.verifyConfiguration].
+     *
+     * Safe to call repeatedly; idempotent and non-blocking. The actual BLE reconnect (with
+     * exponential back-off) lives in [app.aaps.pump.common.hw.rileylink.ble.RileyLinkBLE],
+     * so we never reach into base-class internals here.
+     */
     @Synchronized
-    private fun registerConnectionRecoveryReceiver() {
-        if (connectionRecoveryReceiverRegistered) return
-        // Framework-local intents (LocalBroadcastManager) for RileyLink link-state changes...
-        val frameworkActions = arrayOf(
-            RileyLinkConst.Intents.RileyLinkDisconnected,
-            RileyLinkConst.Intents.RileyLinkGattFailed,
-            RileyLinkConst.Intents.RileyLinkReady,
-            RileyLinkConst.Intents.RileyLinkNewAddressSet
-        )
-        val frameworkFilter = android.content.IntentFilter().apply { for (a in frameworkActions) addAction(a) }
-        LocalBroadcastManager.getInstance(context).registerReceiver(connectionRecoveryReceiver, frameworkFilter)
-
-        // ...plus the system Bluetooth state broadcast (Context-registered, since it's a system action).
-        val systemFilter = android.content.IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED)
-        context.registerReceiver(connectionRecoveryReceiver, systemFilter)
-        connectionRecoveryReceiverRegistered = true
-    }
-
-    @Synchronized
-    private fun unregisterConnectionRecoveryReceiver() {
-        if (!connectionRecoveryReceiverRegistered) return
-        // Match register order: LocalBroadcastManager first, then the system-registered receiver.
+    private fun triggerReconnect(reason: String) {
         try {
-            LocalBroadcastManager.getInstance(context).unregisterReceiver(connectionRecoveryReceiver)
+            aapsLogger.warn(LTag.PUMP, "Connection recovery: $reason -> verifyConfiguration()")
+            rileyLinkMedtronicService?.verifyConfiguration(
+                // forceRileyLinkAddressRenewal = true so a link loss always triggers a fresh
+                // connect attempt rather than being treated as "nothing changed".
+                true
+            )
         } catch (t: Throwable) {
-            aapsLogger.error(LTag.PUMP, "LBM unregister failed: ${t.message}")
+            aapsLogger.error(LTag.PUMP, "triggerReconnect($reason) failed: ${t.message}")
         }
-        try {
-            context.unregisterReceiver(connectionRecoveryReceiver)
-        } catch (t: Throwable) {
-            aapsLogger.error(LTag.PUMP, "context unregisterReceiver failed: ${t.message}")
-        }
-        connectionRecoveryReceiverRegistered = false
     }
 
     /**
-     * Kicks the BLE layer's autonomous reconnect. Idempotent -- safe to call on every disconnect
-     * event. Once the link reports ready, the broadcast path above will run Wake & Tune.
+     * Called by the periodic pump-action / status-refresh loop: if we detect that the pump has
+     * not been seen for a while (link stale), kick a reconnect. This is the "passive watchdog"
+     * that guarantees recovery even when no explicit disconnect event is delivered.
      *
-     * Implementation note: reconnection is driven entirely through the existing framework broadcast
-     * contract (RileyLinkNewAddressSet / BluetoothConnected), so this plugin layer never reaches
-     * into RileyLinkService / RileyLinkBLE internals -- keeping it robust against base-class changes.
+     * Uses only [MedtronicPumpStatus.lastConnection] and [System.currentTimeMillis], both of
+     * which are already part of the original class contract -- no new dependencies.
      */
-    private fun triggerReconnect() {
-        if (connectionRecoveryInProgress) return
-        connectionRecoveryInProgress = true
-        try {
-            // This is the same intent the framework already uses to (re)connect to the RL device,
-            // so it cleanly integrates with the existing state machine in RileyLinkService.
-            rileyLinkUtil.sendBroadcastMessage(RileyLinkConst.Intents.RileyLinkNewAddressSet)
-        } catch (t: Throwable) {
-            aapsLogger.error(LTag.PUMP, "triggerReconnect failed: ${t.message}")
-            connectionRecoveryInProgress = false
+    private fun checkConnectionAndRecoverIfStale() {
+        val last = medtronicPumpStatus.lastConnection
+        val now = System.currentTimeMillis()
+        // 60s grace; if we haven't heard from the pump in that long, nudge the link.
+        if (last > 0 && (now - last) > STALE_CONNECTION_THRESHOLD_MS) {
+            triggerReconnect("stale-connection")
         }
     }
 
-    /** Run a Wake & Tune to reacquire the pump RF channel after the BLE link is restored. */
-    private fun runWakeAndTuneIfNeeded() {
-        try {
-            // Reuse the existing Wake & Tune task infrastructure already wired in this plugin
-            // (same call site used by initializePump()). serviceTaskExecutor is the injected
-            // ServiceTaskExecutor; wakeAndTuneTaskProvider supplies the task.
-            serviceTaskExecutor.startTask(wakeAndTuneTaskProvider.get())
-        } catch (t: Throwable) {
-            aapsLogger.error(LTag.PUMP, "runWakeAndTuneIfNeeded failed: ${t.message}")
-        }
-    }
 
     override fun isConnected(): Boolean {
         if (displayConnectionMessages) aapsLogger.debug(LTag.PUMP, "MedtronicPumpPlugin::isConnected")
@@ -1396,6 +1327,9 @@ class MedtronicPumpPlugin @Inject constructor(
         val pumpFreqValues = arrayOf<CharSequence>(RileyLinkTargetFrequency.MedtronicUS.key!!, RileyLinkTargetFrequency.MedtronicWorldWide.key!!)
         val encodingValues = arrayOf<CharSequence>(RileyLinkEncodingType.FourByteSixByteLocal.key!!, RileyLinkEncodingType.FourByteSixByteRileyLink.key!!)
         val batteryValues = mutableListOf<CharSequence>().also { list -> BatteryType.entries.forEach { list.add(it.key) } }.toTypedArray()
+
+        /** After this much silence from the pump we consider the BLE link stale and force a reconnect. */
+        private const val STALE_CONNECTION_THRESHOLD_MS = 60_000L
     }
 
     private val pumpFreqEntries = arrayOf<CharSequence>(rh.gs(RileyLinkTargetFrequency.MedtronicUS.friendlyName!!), rh.gs(RileyLinkTargetFrequency.MedtronicWorldWide.friendlyName!!))

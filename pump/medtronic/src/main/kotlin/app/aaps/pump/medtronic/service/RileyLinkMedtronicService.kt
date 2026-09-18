@@ -44,15 +44,7 @@ import javax.inject.Singleton
  */
 @Singleton
 class RileyLinkMedtronicService : RileyLinkService() {
-override fun verifyConfiguration(force: Boolean): Boolean {
-    val ok = super.verifyConfiguration(force)
-    if (ok) {
-        // 通过公共数据对象设状态
-        rileyLinkServiceData.setRileyLinkServiceState(RileyLinkServiceState.RileyLinkReady)
-        aapsLogger.debug("✅ Pump verified → RileyLinkReady")
-    }
-    return ok
-}
+
     @Inject lateinit var medtronicPumpPlugin: MedtronicPumpPlugin
     @Inject lateinit var medtronicUtil: MedtronicUtil
     @Inject lateinit var medtronicPumpStatus: MedtronicPumpStatus

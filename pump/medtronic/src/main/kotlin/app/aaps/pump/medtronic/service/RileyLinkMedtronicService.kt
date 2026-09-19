@@ -31,6 +31,7 @@ import app.aaps.pump.medtronic.keys.MedtronicStringPreferenceKey
 import app.aaps.pump.medtronic.util.MedtronicUtil
 import javax.inject.Inject
 import javax.inject.Singleton
+import app.aaps.pump.common.hw.rileylink.defs.RileyLinkServiceState
 
 /**
  * RileyLinkMedtronicService is intended to stay running when the gui-app is closed.

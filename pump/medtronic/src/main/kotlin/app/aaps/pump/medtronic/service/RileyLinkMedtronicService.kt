@@ -308,7 +308,6 @@ class RileyLinkMedtronicService : RileyLinkService() {
     val isInitialized: Boolean
         get() = rileyLinkServiceData.rileyLinkServiceState.isReady()
 
-    override fun verifyConfiguration(forceRileyLinkAddressRenewal: Boolean): Boolean {
         return try {
             val regexSN = "[0-9]{6}"
             val regexMac = "([\\da-fA-F]{1,2}(?::|$)){6}"

@@ -72,7 +72,9 @@ class RileyLinkMedtronicService : RileyLinkService() {
     private var reconnectPending = false
     private var reconnectReceiverRegistered = false
     private val reconnectReceiver = createReconnectReceiver()
-
+    private var rfReconnectCount = 0
+    private var rfReconnectWindowStart = 0L
+   
     override fun onCreate() {
         super.onCreate()
         aapsLogger.debug(LTag.PUMPCOMM, "RileyLinkMedtronicService newly created")

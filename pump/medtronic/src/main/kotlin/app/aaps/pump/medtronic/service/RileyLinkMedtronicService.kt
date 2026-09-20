@@ -31,7 +31,6 @@ import app.aaps.pump.medtronic.keys.MedtronicStringPreferenceKey
 import app.aaps.pump.medtronic.util.MedtronicUtil
 import javax.inject.Inject
 import javax.inject.Singleton
-import app.aaps.pump.common.hw.rileylink.defs.RileyLinkServiceState
 
 /**
  * RileyLinkMedtronicService is intended to stay running when the gui-app is closed.
@@ -308,6 +307,7 @@ class RileyLinkMedtronicService : RileyLinkService() {
     val isInitialized: Boolean
         get() = rileyLinkServiceData.rileyLinkServiceState.isReady()
 
+    override fun verifyConfiguration(forceRileyLinkAddressRenewal: Boolean): Boolean {
         return try {
             val regexSN = "[0-9]{6}"
             val regexMac = "([\\da-fA-F]{1,2}(?::|$)){6}"
@@ -418,5 +418,8 @@ class RileyLinkMedtronicService : RileyLinkService() {
     fun setNotInPreInit(): Boolean {
         inPreInit = false
         return reconfigureService(false)
+   const val RECONNECT_MAX_TOTAL = 20          // 累计最多重试 20 次
+   const val RECONNECT_COOLDOWN_MIN = 5        // 5 分钟内不再触发自动重连（等用户手动干预）
+    
     }
 }

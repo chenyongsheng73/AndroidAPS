@@ -55,7 +55,11 @@ class RileyLinkMedtronicService : RileyLinkService() {
     // isInitialized, verifyConfiguration(), etc. in the original code). We deliberately do NOT
     // re-declare them here, to avoid "hides member of supertype" / "needs override" errors
     // and to keep the dependency graph identical to the original.
-
+    companion object {
+    private const val RF_RECONNECT_MAX = 3               // RF 通信失败最多 3 次
+    private const val RF_RECONNECT_COOLDOWN_MS = 10 * 60 * 1000L  // 10 分钟冷却
+}
+    
     private val mBinder: IBinder = LocalBinder()
     private var serialChanged = false
     private var rileyLinkAddress: String? = null

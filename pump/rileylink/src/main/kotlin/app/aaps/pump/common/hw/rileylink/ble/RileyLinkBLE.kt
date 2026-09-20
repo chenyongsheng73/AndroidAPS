@@ -528,7 +528,9 @@ class RileyLinkBLE @Inject constructor(
 
         reconnectAttempts++
         aapsLogger.warn(LTag.PUMPBTCOMM, "Reconnect attempt #$reconnectAttempts ...")
-
+         const val RECONNECT_MAX_TOTAL = 20          // 累计最多重试 20 次
+         const val RECONNECT_COOLDOWN_MIN = 5        // 5 分钟内不再触发自动重连（等用户手动干预）
+        
         // We need a device to connect to. If the address was lost, ask the host to re-resolve it
         // via the existing broadcast contract (same mechanism used by RileyLinkNewAddressSet).
         if (rileyLinkDevice == null) {

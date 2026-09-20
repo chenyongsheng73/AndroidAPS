@@ -76,10 +76,16 @@ class RileyLinkBLE @Inject constructor(
         private const val RECONNECT_MAX_DELAY_MS = 30_000L
         private const val RECONNECT_MAX_ATTEMPTS = 10 // hard ceiling; 0 / negative = unlimited
         private const val HEALTH_CHECK_TIMEOUT_MS = 5_000L
-        const val RECONNECT_MAX_TOTAL = 20          // 累计最多重试 20 次
-        const val RECONNECT_COOLDOWN_MIN = 5        // 5 分钟内不再触发自动重连（等用户手动干预）
+        companion object {
+        const val BLE_RECONNECT_MAX = 10           // 最多自动重连 10 次
+        const val BLE_RECONNECT_COOLDOWN_MS = 5 * 60 * 1000L  // 5 分钟冷却
+       }
+
+       private val bleReconnectCount = AtomicInteger(0)
+       private var bleReconnectBlockedUntil = 0L
         
-    }
+
+        
 
     //val bluetoothAdapter: BluetoothAdapter = BluetoothAdapter.getDefaultAdapter()
     val bluetoothAdapter: BluetoothAdapter? get() = (context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager?)?.adapter

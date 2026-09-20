@@ -418,8 +418,6 @@ class RileyLinkMedtronicService : RileyLinkService() {
     fun setNotInPreInit(): Boolean {
         inPreInit = false
         return reconfigureService(false)
-   const val RECONNECT_MAX_TOTAL = 20          // 累计最多重试 20 次
-   const val RECONNECT_COOLDOWN_MIN = 5        // 5 分钟内不再触发自动重连（等用户手动干预）
-    
+  
     }
 }

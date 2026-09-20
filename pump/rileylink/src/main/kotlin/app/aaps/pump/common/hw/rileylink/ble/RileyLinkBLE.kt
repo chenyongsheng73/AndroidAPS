@@ -76,6 +76,9 @@ class RileyLinkBLE @Inject constructor(
         private const val RECONNECT_MAX_DELAY_MS = 30_000L
         private const val RECONNECT_MAX_ATTEMPTS = 10 // hard ceiling; 0 / negative = unlimited
         private const val HEALTH_CHECK_TIMEOUT_MS = 5_000L
+        const val RECONNECT_MAX_TOTAL = 20          // 累计最多重试 20 次
+        const val RECONNECT_COOLDOWN_MIN = 5        // 5 分钟内不再触发自动重连（等用户手动干预）
+        
     }
 
     //val bluetoothAdapter: BluetoothAdapter = BluetoothAdapter.getDefaultAdapter()
@@ -528,8 +531,6 @@ class RileyLinkBLE @Inject constructor(
 
         reconnectAttempts++
         aapsLogger.warn(LTag.PUMPBTCOMM, "Reconnect attempt #$reconnectAttempts ...")
-         const val RECONNECT_MAX_TOTAL = 20          // 累计最多重试 20 次
-         const val RECONNECT_COOLDOWN_MIN = 5        // 5 分钟内不再触发自动重连（等用户手动干预）
         
         // We need a device to connect to. If the address was lost, ask the host to re-resolve it
         // via the existing broadcast contract (same mechanism used by RileyLinkNewAddressSet).

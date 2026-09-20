@@ -75,36 +75,7 @@ class RileyLinkMedtronicService : RileyLinkService() {
     private var rfReconnectCount = 0
     private var rfReconnectWindowStart = 0L
    
-    private fun maybeWakeAndTune(): Boolean {
-    val now = System.currentTimeMillis()
-    
-    if (now - rfReconnectWindowStart > RF_RECONNECT_COOLDOWN_MS) {
-        rfReconnectCount = 0
-        rfReconnectWindowStart = now
-    }
-    
-    rfReconnectCount++
-    
-    if (rfReconnectCount > RF_RECONNECT_MAX) {
-        log("🛑 RF/Wake&Tune 失败已达 $RF_RECONNECT_MAX 次/10min，停止自动 RF 重连")
-        rxBus.send(
-            EventNewNotification(
-                Notification(
-                    "泵 RF 通信连续失败，已暂停自动尝试。请检查泵距离/电池，或手动 Refresh。",
-                    Notification.URGENT,
-                    60
-                )
-            )
-        )
-        // ★ 状态回退，避免 UI 一直转
-        rileyLinkServiceData.rileyLinkServiceState = RileyLinkServiceState.NotReady
-        return false
-    }
-    
-    log("📡 RF 尝试 $rfReconnectCount/$RF_RECONNECT_MAX")
-    return true
-}
-    
+  
     override fun onCreate() {
         super.onCreate()
         aapsLogger.debug(LTag.PUMPCOMM, "RileyLinkMedtronicService newly created")

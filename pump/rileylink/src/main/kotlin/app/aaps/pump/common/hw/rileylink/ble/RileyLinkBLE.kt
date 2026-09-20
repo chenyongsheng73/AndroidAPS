@@ -41,8 +41,10 @@ import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.Semaphore
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import javax.inject.Inject
 import javax.inject.Singleton
+
 
 /**
  * Created by geoff on 5/26/16.
@@ -80,6 +82,8 @@ class RileyLinkBLE @Inject constructor(
     const val BLE_RECONNECT_COOLDOWN_MS = 5 * 60 * 1000L
 }
 
+private val bleReconnectCount = AtomicInteger(0)
+private var bleReconnectBlockedUntil = 0L
 
     //val bluetoothAdapter: BluetoothAdapter = BluetoothAdapter.getDefaultAdapter()
     val bluetoothAdapter: BluetoothAdapter? get() = (context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager?)?.adapter

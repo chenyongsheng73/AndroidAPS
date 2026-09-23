@@ -233,9 +233,7 @@ class DateUtilImpl @Inject constructor(
         return if (abs(minutes) > 9999) "" else rh.gs(R.string.minago_long, minutes)
     }
 
-    override fun hourAgo(time: Long, rh: ResourceHelper): String {
-        val duration = (now() - time).milliseconds
-        val hours = duration.inWholeHours
+    
     override fun hourAgo(time: Long, rh: ResourceHelper): String {
         val hours = (now() - time) / 1000.0 / 60 / 60
         return rh.gs(R.string.hoursago, hours)
